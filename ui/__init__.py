@@ -1,0 +1,4 @@
+"""
+GrabVidZilla - GUI интерфейс.
+"""
+

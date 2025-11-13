@@ -1,0 +1,4 @@
+"""
+GrabVidZilla - CLI интерфейс.
+"""
+

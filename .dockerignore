@@ -1,0 +1,37 @@
+# VCS and virtual env
+.git
+.venv/
+
+# Python caches and build artifacts
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.cache/
+dist/
+build/
+
+# Local downloads and large media
+Downloads/
+*.mp4
+*.mkv
+*.webm
+*.m4a
+*.part
+*.ytdl
+*.aria2
+
+# Tools not needed inside Linux image
+tools/ffmpeg/
+tools/cookies.txt
+
+# Optional: exclude tests and scripts from runtime image
+tests/
+scripts/
+
+# OS-specific junk
+.DS_Store
+Thumbs.db
+
+
