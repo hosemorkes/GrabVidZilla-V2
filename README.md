@@ -291,6 +291,132 @@ def analyze_video(
   - `qualities`: список удобных меток качеств (например, `'2160p'`, `'1080p'`, …, `'audio only'`),
   - `subtitle_langs`: доступные языки субтитров (коды вроде `['en', 'ru', ...]`).
 
+## REST API
+
+### Запуск сервера
+
+Локальный запуск из корня проекта (после установки зависимостей):
+
+```bash
+uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Документация (FastAPI):
+- Swagger UI: `http://localhost:8000/docs`
+- ReDoc: `http://localhost:8000/redoc`
+
+По умолчанию CORS открыт для всех источников (для удобства разработки).
+
+### Эндпоинты
+
+- GET `/health`
+  - Ответ: `{"status": "ok"}`
+
+- GET `/formats?url=<HttpUrl>`
+  - Возвращает подробный `info` от yt-dlp (включая отфильтрованные `formats`).
+  - Коды ошибок: `400` (невалидный URL), `422` (ошибка извлечения форматов).
+
+- POST `/downloads`
+  - Тело запроса (JSON):
+    ```json
+    {
+      "url": "https://www.youtube.com/watch?v=...",
+      "format": "136+140",
+      "audio_only": false
+    }
+    ```
+  - Примечания:
+    - Если `audio_only=true`, параметр `format` игнорируется.
+    - Если указан `format`, API проверяет его доступность для данного URL; при недоступности вернёт `422 format_unavailable`.
+  - Ответ: `201 Created`
+    ```json
+    { "id": "TASK_UUID" }
+    ```
+  - Возможные ошибки: `400` (валидация), `422` (format_unavailable), `429` (слишком много активных загрузок, зависит от стратегии), `500`.
+
+- GET `/downloads`
+  - Возвращает список задач. Элемент:
+    ```json
+    {
+      "id": "TASK_UUID",
+      "url": "https://…",
+      "state": "queued|running|completed|failed|cancelled",
+      "progress_percent": 42.0,
+      "bytes_downloaded": 123456,
+      "total_bytes": 999999,
+      "speed_bps": 123456.7,
+      "eta_s": 12.3,
+      "elapsed_s": 45.6,
+      "filename": "My Video [abc123].mp4",
+      "error": null
+    }
+    ```
+
+- GET `/downloads/{task_id}`
+  - Возвращает состояние конкретной задачи в таком же формате, как выше.
+
+- DELETE `/downloads/{task_id}`
+  - Отменяет задачу в состояниях `queued|running`.
+  - Ответ: `204 No Content` (тело: `{"status": "cancelled"}`).
+  - Ошибки: `404` (нет задачи), `409` (нельзя отменить в текущем состоянии).
+
+- GET `/downloads/{task_id}/file`
+  - Возвращает скачанный файл (Content-Disposition с именем).
+  - Ошибки: `409 file_not_ready`, `404 task_not_found`, `500 file_missing`.
+
+### Примеры cURL
+
+```bash
+# Проверка здоровья
+curl http://localhost:8000/health
+
+# Получить доступные форматы
+curl -G "http://localhost:8000/formats" --data-urlencode "url=https://www.youtube.com/watch?v=VIDEO_ID"
+
+# Старт загрузки (видео+аудио с конкретным format-id или их суммой)
+curl -X POST "http://localhost:8000/downloads" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://www.youtube.com/watch?v=VIDEO_ID","format":"136+140","audio_only":false}'
+
+# Старт загрузки (только аудио)
+curl -X POST "http://localhost:8000/downloads" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://www.youtube.com/watch?v=VIDEO_ID","audio_only":true}'
+
+# Список задач
+curl http://localhost:8000/downloads
+
+# Статус задачи
+curl http://localhost:8000/downloads/TASK_UUID
+
+# Скачать итоговый файл
+curl -OJ http://localhost:8000/downloads/TASK_UUID/file
+
+# Отменить задачу
+curl -X DELETE http://localhost:8000/downloads/TASK_UUID
+```
+
+### Переменные окружения
+
+- `DOWNLOADS_DIR` (по умолчанию `downloads`) — куда сохранять файлы.
+- `MAX_CONCURRENT_DOWNLOADS` (по умолчанию `2`) — максимальное число одновременных загрузок.
+- `PROGRESS_UPDATE_INTERVAL_MS` (по умолчанию `500`) — частота обновления прогресса в API.
+- `CLEANUP_INTERVAL_MIN` (по умолчанию `10`) — как часто запускать фоновую очистку завершённых задач.
+- `DOWNLOAD_TTL_HOURS` (по умолчанию `24`) — TTL для хранения скачанных файлов и записей задач (если `PERSIST_DOWNLOADS=false`).
+- `PERSIST_DOWNLOADS` (`false`/`true`) — если `true`, файлы не удаляются автоматически по TTL.
+- `QUEUE_STRATEGY` (`enqueue`/`reject`; по умолчанию `enqueue`) — поведение при превышении лимита параллельных загрузок.
+
+Примечания:
+- Прогресс обновляется с шагом `PROGRESS_UPDATE_INTERVAL_MS`, поэтому при частом опросе клиента значения могут меняться не на каждый запрос.
+- Если `QUEUE_STRATEGY=reject`, при попытке стартовать новую загрузку сверх лимита API вернёт `429` с `max_concurrent`.
+- CORS открыт ко всем доменам — при необходимости ограничьте в `api.main`.
+
+### Интеграционные подсказки
+
+- Для выбора `format` получите список доступных format-id через `/formats` (поле `formats`) и подберите подходящую комбинацию `video+audio`.
+- Для аудио используйте `audio_only=true` — сервер сам выберет надёжный аудиоформат.
+- Рекомендуется поллинг `/downloads/{id}` до `state=completed`, затем скачивание `/downloads/{id}/file`.
+
 ## FAQ/Траблшутинг
 
 - 403 / “Failed to parse JSON”: используйте актуальные cookies, попробуйте другой аккаунт/регион.

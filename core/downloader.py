@@ -8,7 +8,10 @@
 from __future__ import annotations
 
 import os
-from typing import Callable
+from typing import Callable, Optional, Tuple, List, Dict, Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from threading import Event
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -76,6 +79,13 @@ def _filter_valid_formats(formats: list[dict]) -> list[dict]:
             continue
         valid.append(f)
     return valid
+
+
+class DownloadCancelled(RuntimeError):
+    """
+    Исключение, сигнализирующее о корректной отмене загрузки пользователем.
+    Используется для прерывания процесса в хукe прогресса.
+    """
 
 
 def extract_info_multi(
@@ -163,6 +173,7 @@ def download_video(
     output_path: str = ".",
     progress_callback: Callable[[float], None] | None = None,
     progress_info_callback: Callable[[dict], None] | None = None,
+    cancel_event: "Optional[Event]" = None,
     cookies_path: str | None = None,
     format: str | None = None,
     audio_only: bool = False,
@@ -176,6 +187,7 @@ def download_video(
         output_path: Путь для сохранения (по умолчанию текущая директория)
         progress_callback: Функция обратного вызова для прогресса (принимает float от 0 до 100)
         progress_info_callback: Доп. колбек с подробной информацией (speed, bytes, total)
+        cancel_event: Опциональный Event для отмены загрузки (устанавливается извне)
         cookies_path: Путь к cookies.txt (формат Netscape). Если указан — передаётся yt-dlp
         format: Желаемый формат (опционально)
         audio_only: Загрузить только аудио (True) или видео+аудио (False)
@@ -220,6 +232,24 @@ def download_video(
         - когда status == "finished": запоминаем путь к файлу, который сформировал yt-dlp.
         """
         status = d.get("status")
+        # Проверка на отмену — максимально рано, чтобы прерывать быстро
+        try:
+            if cancel_event is not None and cancel_event.is_set():
+                # Почистим временные файлы, если доступны пути
+                tmp = d.get("tmpfilename") or d.get("filename")
+                if isinstance(tmp, str):
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except Exception:
+                        pass
+                raise DownloadCancelled("Загрузка отменена пользователем")
+        except DownloadCancelled:
+            # Пробрасываем дальше, чтобы yt-dlp прекратил работу
+            raise
+        except Exception:
+            # Любые ошибки в блоке отмены не должны ломать основной процесс
+            pass
         if status == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             downloaded = d.get("downloaded_bytes", 0)
@@ -354,10 +384,43 @@ def download_video(
             raise RuntimeError("Не удалось определить путь загруженного файла")
         return str(filepath)
 
+    except DownloadCancelled as e:
+        _debug("download_video: cancelled by user")
+        raise
     except DownloadError as e:
         _debug(f"download_video: error {e}")
         raise RuntimeError(f"Ошибка загрузки: {e}") from e
 
+
+def probe_video(
+    url: str,
+    cookies_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Возвращает метаданные и доступные форматы видео без скачивания.
+
+    Args:
+        url: URL контента
+        cookies_path: путь к cookies.txt при необходимости
+
+    Returns:
+        Словарь info как возвращает yt-dlp (отфильтрованные форматы в поле 'formats').
+
+    Raises:
+        ValueError | RuntimeError при ошибках валидации/извлечения.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("URL должен быть непустой строкой")
+    lowered = url.strip().lower()
+    if not (lowered.startswith("http://") or lowered.startswith("https://")):
+        raise ValueError("URL должен начинаться с http:// или https://")
+    url = _normalize_youtube_url(url)
+    try:
+        po_token = os.getenv("YT_PO_TOKEN")
+        info, _ = extract_info_multi(url, cookies_path=cookies_path, po_token=po_token)
+        return info
+    except Exception as e:
+        raise RuntimeError(f"Не удалось извлечь информацию о видео: {e}") from e
 
 def analyze_video(
     url: str,
