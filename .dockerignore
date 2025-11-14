@@ -2,6 +2,11 @@
 .git
 .venv/
 
+# Editor/IDE and local configs
+.cursor/
+.idea/
+.vscode/
+
 # Python caches and build artifacts
 __pycache__/
 *.pyc
@@ -12,17 +17,22 @@ __pycache__/
 dist/
 build/
 
-# Local downloads and large media
+# Local runtime data (БД пользователей и загрузки)
+data/
 Downloads/
+downloads/
+
+# Медиа и временные файлы от загрузчика
 *.mp4
 *.mkv
 *.webm
 *.m4a
+*.mp3
 *.part
 *.ytdl
 *.aria2
 
-# Tools not needed inside Linux image
+# Tools не нужны внутри Linux-образа
 tools/ffmpeg/
 tools/cookies.txt
 

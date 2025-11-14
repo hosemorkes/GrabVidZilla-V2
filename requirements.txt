@@ -13,6 +13,9 @@ streamlit==1.51.0
 # Утилиты
 requests==2.32.3
 
+# База данных
+SQLAlchemy==2.0.44
+
 # REST API
 fastapi==0.121.1
 uvicorn[standard]==0.38.0

@@ -23,6 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.downloader import download_video, analyze_video
+from ui import auth_ui
 
 
 def _get_default_downloads_dir() -> Path:
@@ -180,6 +181,36 @@ def main() -> None:
     st.set_page_config(page_title="GrabVidZilla", page_icon="🎬", layout="centered", initial_sidebar_state="collapsed")
     _init_session_state()
 
+    # Блок аутентификации (логин/регистрация/выход)
+    auth_ui.render_auth_block()
+    auth_ui.require_login()
+
+    # Профильное меню в верхнем левом углу:
+    # - компактный индикатор профиля (👤 user);
+    # - при наличии прав admin — иконка ⚙ с панелью управления пользователями.
+    user_info = getattr(st.session_state, "current_user", None) or st.session_state.get("current_user")
+    if user_info:
+        header_cols = st.columns([2, 3])
+        with header_cols[0]:
+            profile_cols = st.columns([1, 1])
+            # Неброский профильный индикатор: при клике раскрывается поповер
+            with profile_cols[0]:
+                with st.popover(f"👤 {user_info.get('name', '')}", use_container_width=False):
+                    st.markdown(
+                        f"**Пользователь:** {user_info.get('name', '')}\n\n"
+                        f"`{user_info.get('email', '')}`"
+                    )
+                    if st.button("Выйти", key="header_logout_btn"):
+                        auth_ui.logout()
+                        st.rerun()
+            # Иконка настроек только для администраторов
+            if user_info.get("is_admin"):
+                with profile_cols[1]:
+                    with st.popover("⚙️", use_container_width=True):
+                        auth_ui.render_admin_panel()
+        with header_cols[1]:
+            pass  # справа оставляем место под заголовок/логотип
+
     # Внутренние стили для оформления экрана под макет
     st.markdown(
         """
@@ -187,7 +218,9 @@ def main() -> None:
         /* Подключение шрифта Work Sans */
         @import url('https://fonts.googleapis.com/css2?family=Work+Sans:wght@600;700;800&display=swap');
 
-        /* Глобально применяем Work Sans ко всем основным контейнерам и виджетам */
+        /* Глобально применяем Work Sans ко всем основным контейнерам и виджетам,
+           но не трогаем иконки (Material Icons), чтобы не появлялись тексты
+           вроде 'keyboard_arrow_right'. */
         :root, html, body, .stApp, .main .block-container,
         [data-testid="stMarkdownContainer"],
         [data-testid="stWidgetLabel"],
@@ -293,8 +326,18 @@ def main() -> None:
         section[data-testid="stSidebar"] { display: none !important; }
         div[data-testid="collapsedControl"] { display: none !important; }
         /* Убираем кнопку/панель Deploy/Toolbar в шапке */
-        div[data-testid="stToolbar"] { display: none !important; }
-        header [data-testid="stToolbar"] { display: none !important; }
+        div[data-testid="stToolbar"],
+        [data-testid="stToolbar"],
+        header [data-testid="stToolbar"],
+        .stAppToolbar,
+        button[data-testid="stBaseButton-header"],
+        button[data-testid="stBaseButton-headerNoPadding"] {
+            display: none !important;
+            visibility: hidden !important;
+            height: 0 !important;
+            padding: 0 !important;
+            margin: 0 !important;
+        }
         #MainMenu { visibility: hidden; }
         header { height: 0px; visibility: hidden; }
 
