@@ -12,6 +12,7 @@ streamlit==1.51.0
 
 # Утилиты
 requests==2.32.3
+beautifulsoup4==4.14.2
 
 # База данных
 SQLAlchemy==2.0.44

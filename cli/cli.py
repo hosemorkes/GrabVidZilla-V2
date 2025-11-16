@@ -14,6 +14,7 @@ from rich.console import Console
 from rich.progress import Progress, BarColumn, TextColumn, SpinnerColumn
 
 from core.downloader import download_video, analyze_video
+from core.parser import find_media_urls
 
 
 console = Console()
@@ -141,6 +142,7 @@ def _show_menu_and_handle() -> None:
         console.print("1. Скачать видео")
         console.print("2. help")
         console.print("3. Загрузить cookies")
+        console.print("4. Найти видео на странице")
         console.print("0. Выход")
         choice = click.prompt("Выберите пункт", type=int, default=1)
 
@@ -240,6 +242,7 @@ def _show_menu_and_handle() -> None:
             # Загрузка свежих cookies в tools/cookies.txt
             import os
             import shutil
+
             project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
             tools_dir = os.path.join(project_root, "tools")
             os.makedirs(tools_dir, exist_ok=True)
@@ -253,6 +256,71 @@ def _show_menu_and_handle() -> None:
                     console.print(f"[green]Cookies сохранены[/green]: {dst}")
                 except Exception as e:
                     console.print(f"[red]Не удалось сохранить cookies[/red]: {e}")
+            console.print()
+            continue
+        elif choice == 4:
+            # Поиск медиаконтента на HTML-странице и последующая загрузка выбранного видео
+            import os
+
+            page_url = click.prompt("Введите URL страницы", type=str)
+
+            # Определяем cookies так же, как в режиме скачивания видео
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            default_cookies = os.path.join(project_root, "tools", "cookies.txt")
+            use_cookies = default_cookies if os.path.isfile(default_cookies) else None
+
+            try:
+                hls_urls, file_urls = find_media_urls(page_url, cookies_path=use_cookies)
+            except Exception as exc:
+                console.print(f"[red]Не удалось найти видео на странице[/red]: {exc}")
+                console.print()
+                continue
+
+            if not hls_urls and not file_urls:
+                console.print("[yellow]На странице не найдено ни одного видео или HLS-потока.[/yellow]")
+                console.print()
+                continue
+
+            # Формируем единый нумерованный список для выбора
+            console.print("[bold]Найденные видео и потоки:[/bold]")
+            indexed: list[tuple[str, str]] = []  # (label, url)
+
+            if hls_urls:
+                console.print("HLS (m3u8):")
+                for idx, u in enumerate(hls_urls, start=1):
+                    label = f"HLS #{idx}"
+                    console.print(f"  {len(indexed)+1}. {label}: {u}")
+                    indexed.append((label, u))
+
+            if file_urls:
+                console.print("Файлы:")
+                for idx, u in enumerate(file_urls, start=1):
+                    label = f"FILE #{idx}"
+                    console.print(f"  {len(indexed)+1}. {label}: {u}")
+                    indexed.append((label, u))
+
+            try:
+                choice_idx = click.prompt(
+                    "Выберите номер видео для загрузки", type=int, default=1
+                )
+            except Exception:
+                console.print("[red]Некорректный выбор.[/red]")
+                console.print()
+                continue
+
+            if not (1 <= choice_idx <= len(indexed)):
+                console.print("[red]Номер вне диапазона.[/red]")
+                console.print()
+                continue
+
+            _, selected_url = indexed[choice_idx - 1]
+            # Для найденных ссылок не навязываем формат — пусть ядро само решит
+            _run_download(
+                url=selected_url,
+                output_path="Downloads",
+                cookies_path=use_cookies,
+                fmt=None,
+            )
             console.print()
             continue
         elif choice == 0:

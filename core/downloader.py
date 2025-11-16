@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
+import re
 
 # Простое условное логирование в файл для отладки (включается через переменную окружения GVZ_DEBUG=1)
 def _debug(message: str) -> None:
@@ -31,6 +32,41 @@ def _debug(message: str) -> None:
     except Exception:
         # Логи не должны ломать логику
         pass
+
+
+def _clean_yt_dlp_error_message(raw: str) -> str:
+    """
+    Очищает текст ошибок yt-dlp от ANSI-кодов и префикса 'ERROR:'.
+
+    Нужен, чтобы в исключениях, которые видит пользователь (CLI/UI),
+    не было цветовых кодов терминала и лишнего шума.
+    """
+    if not raw:
+        return ""
+    text = str(raw)
+    # Удаляем ANSI escape-последовательности вида \x1b[0;31m ... \x1b[0m
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    # Удаляем ведущий 'ERROR:' (один или несколько раз)
+    text = re.sub(r"^ERROR:\s*", "", text, flags=re.IGNORECASE)
+    text = text.strip()
+    return text
+
+
+class _SilentLogger:
+    """Логгер для yt-dlp, полностью подавляющий вывод (debug/warning/error).
+
+    Используется, чтобы yt-dlp не печатал свои сообщения напрямую в stderr,
+    а все ошибки обрабатывались на уровне core/cli/ui.
+    """
+
+    def debug(self, msg: str) -> None:  # pragma: no cover - простая заглушка
+        return
+
+    def warning(self, msg: str) -> None:  # pragma: no cover
+        return
+
+    def error(self, msg: str) -> None:  # pragma: no cover
+        return
 
 
 def _normalize_youtube_url(src_url: str) -> str:
@@ -62,6 +98,28 @@ def _normalize_youtube_url(src_url: str) -> str:
     except Exception:
         pass
     return src_url
+
+
+def _is_hls_m3u8_url(url: str) -> bool:
+    """
+    Простая проверка, что URL указывает на HLS-поток (m3u8-плейлист).
+
+    Мы не пытаемся полностью разбирать протоколы yt-dlp, а лишь проверяем:
+    - путь заканчивается на ".m3u8";
+    - либо в строке URL явно встречается ".m3u8".
+    """
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        if parsed.path.lower().endswith(".m3u8"):
+            return True
+    except Exception:
+        # В случае ошибок парсинга попробуем простой поиск подстроки
+        pass
+    return ".m3u8" in url.lower()
 
 
 def _filter_valid_formats(formats: list[dict]) -> list[dict]:
@@ -111,7 +169,7 @@ def extract_info_multi(
             "noprogress": True,
             "no_warnings": True,
             "skip_download": True,
-            "logger": None,
+            "logger": _SilentLogger(),
             "geo_bypass": True,
             "retries": 2,
             "extractor_retries": 1,
@@ -164,7 +222,10 @@ def extract_info_multi(
             continue
 
     if last_err:
-        raise RuntimeError(f"Не удалось извлечь форматы (пробовали: {clients}): {last_err}") from last_err
+        clean_msg = _clean_yt_dlp_error_message(str(last_err))
+        # В подробностях (clients/оригинальное сообщение) можно посмотреть debug.log,
+        # пользователю достаточно краткого описания.
+        raise RuntimeError(f"Не удалось извлечь форматы для этого URL. Детали: {clean_msg}") from last_err
     raise RuntimeError("Не удалось извлечь форматы: неизвестная ошибка")
 
 
@@ -207,7 +268,7 @@ def download_video(
     if not (lowered.startswith("http://") or lowered.startswith("https://")):
         raise ValueError("URL должен начинаться с http:// или https://")
 
-    # Нормализуем Shorts-ссылки
+    # Нормализуем Shorts-ссылки (для YouTube) и оставляем остальные URL без изменений
     url = _normalize_youtube_url(url)
     _debug(f"download_video: normalized_url={url}")
 
@@ -279,15 +340,6 @@ def download_video(
             # yt-dlp сообщает путь к итоговому файлу после скачивания
             last_filename[0] = d.get("filename")
 
-    # Тихий логгер, чтобы yt-dlp не печатал ошибки напрямую (избегаем дублей в CLI)
-    class _SilentLogger:
-        def debug(self, msg: str) -> None:
-            pass
-        def warning(self, msg: str) -> None:
-            pass
-        def error(self, msg: str) -> None:
-            pass
-
     # Базовые опции yt-dlp: тихий режим, свой шаблон имени и наш хук прогресса
     ydl_opts: dict = {
         "quiet": True,
@@ -330,14 +382,58 @@ def download_video(
     # Базовый выбор формата (будет уточнён после анализа info ниже)
     ydl_opts["format"] = format or "bv*+ba/best"
 
+    # Специализированная ветка для прямых HLS (m3u8) URL.
+    # Для таких ссылок yt-dlp сам корректно обрабатывает плейлисты,
+    # нам достаточно передать URL и, при необходимости, включить hls_use_mpegts.
+    is_hls = _is_hls_m3u8_url(url)
+    if is_hls:
+        hls_opts = dict(ydl_opts)
+        # HLS удобно сохранять как mpegts, чтобы уменьшить риск порчи файла.
+        hls_opts["hls_use_mpegts"] = True
+        # Для HLS обычно достаточно "best" или "bestaudio/best".
+        if audio_only:
+            hls_opts["format"] = "bestaudio/best"
+        else:
+            hls_opts["format"] = format or "best"
+
+        _debug(
+            f"download_video(HLS): is_hls=True format={hls_opts['format']} "
+            f"output_path={target_dir}"
+        )
+        try:
+            with YoutubeDL(hls_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filepath = ydl.prepare_filename(info)
+            _debug(f"download_video(HLS): downloaded filepath={filepath}")
+
+            if not filepath:
+                filepath = last_filename[0]
+            if not filepath:
+                raise RuntimeError("Не удалось определить путь загруженного файла")
+            return str(filepath)
+        except DownloadCancelled:
+            _debug("download_video(HLS): cancelled by user")
+            raise
+        except DownloadError as e:
+            _debug(f"download_video(HLS): error {e}")
+            clean = _clean_yt_dlp_error_message(str(e))
+            raise RuntimeError(f"Ошибка загрузки HLS-потока: {clean}") from e
+
     # Шаг 1: извлечём info без скачивания (с фолбэком клиентов), чтобы подобрать реально доступный формат
     try:
         po_token = os.getenv("YT_PO_TOKEN")
         info, used_client = extract_info_multi(url, cookies_path=cookies_path, po_token=po_token)
         sample_ids = [str(f.get("format_id")) for f in (info.get("formats") or [])[:8]]
-        _debug(f"download_video: probe_ok clients_used={used_client} formats={len(info.get('formats', []))} ids_sample={sample_ids}")
+        _debug(
+            f"download_video: probe_ok clients_used={used_client} "
+            f"formats={len(info.get('formats', []))} ids_sample={sample_ids}"
+        )
     except Exception as e:
-        raise RuntimeError(f"Ошибка анализа перед загрузкой: {e}") from e
+        # Если это уже наш "дружелюбный" RuntimeError/ValueError — пробрасываем как есть
+        if isinstance(e, (ValueError, RuntimeError)):
+            raise
+        clean = _clean_yt_dlp_error_message(str(e))
+        raise RuntimeError(f"Ошибка анализа перед загрузкой: {clean}") from e
 
     # Подберём безопасный формат на основе info
     desired_height: int | None = None
@@ -415,12 +511,43 @@ def probe_video(
     if not (lowered.startswith("http://") or lowered.startswith("https://")):
         raise ValueError("URL должен начинаться с http:// или https://")
     url = _normalize_youtube_url(url)
+
+    # Для прямых HLS (m3u8) URL используем прямой вызов yt-dlp без
+    # YouTube-специфичных extractor_args.
+    if _is_hls_m3u8_url(url):
+        ydl_opts: dict = {
+            "quiet": True,
+            "noprogress": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "logger": _SilentLogger(),
+            "geo_bypass": True,
+            "retries": 2,
+            "extractor_retries": 1,
+            "socket_timeout": 15,
+        }
+        if cookies_path:
+            ydl_opts["cookiefile"] = cookies_path
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)  # type: ignore[arg-type]
+            return info
+        except Exception as e:
+            clean = _clean_yt_dlp_error_message(str(e))
+            raise RuntimeError(
+                f"Не удалось извлечь информацию об HLS-потоке: {clean}"
+            ) from e
+
     try:
         po_token = os.getenv("YT_PO_TOKEN")
         info, _ = extract_info_multi(url, cookies_path=cookies_path, po_token=po_token)
         return info
     except Exception as e:
-        raise RuntimeError(f"Не удалось извлечь информацию о видео: {e}") from e
+        if isinstance(e, (ValueError, RuntimeError)):
+            # Уже «дружелюбное» сообщение из extract_info_multi или валидации выше
+            raise
+        clean = _clean_yt_dlp_error_message(str(e))
+        raise RuntimeError(f"Не удалось извлечь информацию о видео: {clean}") from e
 
 def analyze_video(
     url: str,
@@ -453,52 +580,96 @@ def analyze_video(
     url = _normalize_youtube_url(url)
     _debug(f"analyze_video: normalized_url={url}")
 
-    try:
-        po_token = os.getenv("YT_PO_TOKEN")
-        info, used_client = extract_info_multi(url, cookies_path=cookies_path, po_token=po_token)
-        _debug(f"analyze_video: extracted formats={len(info.get('formats', []))} client={used_client}")
-        # Если в форматах отсутствуют высоты (или сильно урезаны), попробуем обогащённую обработку (process=True)
-        fmts = info.get("formats") or []
-        missing_heights = any((f.get("vcodec") and f.get("vcodec") != "none") and not f.get("height") for f in fmts)
-        max_h_seen = max([int(f.get("height") or 0) for f in fmts] + [0])
-        if missing_heights or max_h_seen < 2000:
-            try:
-                ydl_opts = {
-                    "quiet": True,
-                    "noprogress": True,
-                    "no_warnings": True,
-                    "skip_download": True,
-                    "logger": None,
-                    "geo_bypass": True,
-                    "retries": 2,
-                    "extractor_retries": 1,
-                    "socket_timeout": 15,
-                    "extractor_args": {
-                        "youtube": {
-                            "player_client": [used_client],
-                            "playback_wait": ["6"],
+    is_hls = _is_hls_m3u8_url(url)
+
+    if is_hls:
+        # Для HLS (m3u8) не используем YouTube-специфичные extractor_args.
+        ydl_opts: dict = {
+            "quiet": True,
+            "noprogress": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "logger": _SilentLogger(),
+            "geo_bypass": True,
+            "retries": 2,
+            "extractor_retries": 1,
+            "socket_timeout": 15,
+        }
+        if cookies_path:
+            ydl_opts["cookiefile"] = cookies_path
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)  # type: ignore[arg-type]
+            _debug(f"analyze_video(HLS): formats={len(info.get('formats', []))}")
+        except Exception as e:
+            _debug(f"analyze_video(HLS): error {e}")
+            clean = _clean_yt_dlp_error_message(str(e))
+            raise RuntimeError(f"Ошибка анализа HLS-потока: {clean}") from e
+    else:
+        try:
+            po_token = os.getenv("YT_PO_TOKEN")
+            info, used_client = extract_info_multi(
+                url, cookies_path=cookies_path, po_token=po_token
+            )
+            _debug(
+                f"analyze_video: extracted formats={len(info.get('formats', []))} "
+                f"client={used_client}"
+            )
+            # Если в форматах отсутствуют высоты (или сильно урезаны), попробуем обогащённую обработку (process=True)
+            fmts = info.get("formats") or []
+            missing_heights = any(
+                (f.get("vcodec") and f.get("vcodec") != "none") and not f.get("height")
+                for f in fmts
+            )
+            max_h_seen = max([int(f.get("height") or 0) for f in fmts] + [0])
+            if missing_heights or max_h_seen < 2000:
+                try:
+                    ydl_opts = {
+                        "quiet": True,
+                        "noprogress": True,
+                        "no_warnings": True,
+                        "skip_download": True,
+                        "logger": _SilentLogger(),
+                        "geo_bypass": True,
+                        "retries": 2,
+                        "extractor_retries": 1,
+                        "socket_timeout": 15,
+                        "extractor_args": {
+                            "youtube": {
+                                "player_client": [used_client],
+                                "playback_wait": ["6"],
+                            },
                         },
-                    },
-                }
-                if cookies_path:
-                    ydl_opts["cookiefile"] = cookies_path
-                if used_client == "android" and po_token:
-                    ydl_opts.setdefault("extractor_args", {}).setdefault("youtube", {})["po_token"] = [po_token]
-                with YoutubeDL(ydl_opts) as ydl:
-                    info2 = ydl.extract_info(url, download=False, process=True)  # type: ignore[arg-type]
-                info2["formats"] = _filter_valid_formats(info2.get("formats") or [])
-                fmts2 = info2.get("formats") or []
-                max_h2 = max([int(f.get("height") or 0) for f in fmts2] + [0])
-                if fmts2 and max_h2 >= max_h_seen:
-                    info = info2
-                    _debug(f"analyze_video: enriched formats via process=True, formats={len(fmts2)} max_h={max_h2}")
-            except Exception as e2:
-                _debug(f"analyze_video: enrich process=True failed: {e2}")
-                # Без паники: оставляем первоначальные данные
-                pass
-    except Exception as e:
-        _debug(f"analyze_video: error {e}")
-        raise RuntimeError(f"Ошибка анализа: {e}") from e
+                    }
+                    if cookies_path:
+                        ydl_opts["cookiefile"] = cookies_path
+                    if used_client == "android" and po_token:
+                        ydl_opts.setdefault("extractor_args", {}).setdefault(
+                            "youtube", {}
+                        )["po_token"] = [po_token]
+                    with YoutubeDL(ydl_opts) as ydl:
+                        info2 = ydl.extract_info(
+                            url, download=False, process=True
+                        )  # type: ignore[arg-type]
+                    info2["formats"] = _filter_valid_formats(info2.get("formats") or [])
+                    fmts2 = info2.get("formats") or []
+                    max_h2 = max([int(f.get("height") or 0) for f in fmts2] + [0])
+                    if fmts2 and max_h2 >= max_h_seen:
+                        info = info2
+                        _debug(
+                            "analyze_video: enriched formats via process=True, "
+                            f"formats={len(fmts2)} max_h={max_h2}"
+                        )
+                except Exception as e2:
+                    _debug(f"analyze_video: enrich process=True failed: {e2}")
+                    # Без паники: оставляем первоначальные данные
+                    pass
+        except Exception as e:
+            _debug(f"analyze_video: error {e}")
+            if isinstance(e, (ValueError, RuntimeError)):
+                raise
+            clean = _clean_yt_dlp_error_message(str(e))
+            raise RuntimeError(f"Ошибка анализа: {clean}") from e
 
     # Собираем качества, предпочитая метку YouTube (quality_label), чтобы 3840x1632 отображалось как "2160p"
     labels: dict[int, str] = {}
