@@ -252,6 +252,29 @@ docker run --rm grabvidzilla --help
 - Windows (Docker Desktop с WSL2): виртуальный диск в `%USERPROFILE%\AppData\Local\Docker\wsl\data\ext4.vhdx`
 - Linux: `/var/lib/docker`
 
+### Сеть Docker для связи с другими контейнерами
+
+- В Docker-образе по умолчанию задано имя сети в переменной окружения `GVZ_DOCKER_NETWORK=grabvidzilla-net` (см. `Dockerfile`).
+- Эту сеть можно создать один раз на хосте и использовать для связи GrabVidZilla с другими контейнерами (БД, прокси и т.п.).
+
+Создание сети:
+
+```bash
+docker network create grabvidzilla-net
+```
+
+Пример запуска CLI в этой сети:
+
+```bash
+docker run --rm -it \
+  --network grabvidzilla-net \
+  -v "${PWD}/downloads:/data" \
+  --name grabvidzilla \
+  grabvidzilla
+```
+
+Любые другие контейнеры, запущенные с `--network grabvidzilla-net`, смогут обращаться к GrabVidZilla по имени контейнера `grabvidzilla`.
+
 ## Установка на Linux-сервер из GitHub
 
 Ниже пример установки GrabVidZilla на Linux-сервер, если исходники лежат на GitHub.
@@ -308,9 +331,10 @@ pip install -r requirements.txt
 1) Установите Docker (для Ubuntu, пример):
 
 ```bash
-sudo apt update
-sudo apt install -y docker.io
-sudo systemctl enable --now docker
+sudo apt update   # обновляет локальный список пакетов из репозиториев
+sudo apt install -y docker.io  # Эта команда устанавливает пакет из стандартных репозиториев Ubuntu
+sudo systemctl enable --now docker # Команда выполняет сразу два действия: enable — включает автоматический запуск службы Docker при загрузке системы.; --now — немедленно запускает службу Docker, без ожидания следующей перезагрузки.
+
 ```
 
 2) Клонируйте репозиторий:

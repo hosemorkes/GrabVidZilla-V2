@@ -2,10 +2,13 @@
 FROM python:3.11-slim
 
 # Базовые переменные окружения для удобной отладки и меньшего мусора
+# GVZ_DOCKER_NETWORK — удобное имя сети, которую можно создать снаружи:
+#   docker network create ${GVZ_DOCKER_NETWORK}
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=UTF-8 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    GVZ_DOCKER_NETWORK=grabvidzilla-net
 
 # Установка ffmpeg (необходим для yt-dlp)
 RUN apt-get update && apt-get install -y --no-install-recommends \
