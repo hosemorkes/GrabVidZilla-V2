@@ -202,7 +202,6 @@ docker run --rm -p 8501:8501 `
 ```bash
 docker run --rm -p 8501:8501 \
   --entrypoint streamlit \
-  -e HOME=/app \
   -v "$HOME/temp/Downloads:/app/Downloads" \
   -v "$(pwd)/tools:/app/tools" \
   grabvidzilla run ui/app.py --server.address=0.0.0.0 --server.port=8501
@@ -252,6 +251,140 @@ docker run --rm grabvidzilla --help
 ### Где Docker хранит данные по умолчанию
 - Windows (Docker Desktop с WSL2): виртуальный диск в `%USERPROFILE%\AppData\Local\Docker\wsl\data\ext4.vhdx`
 - Linux: `/var/lib/docker`
+
+## Установка на Linux-сервер из GitHub
+
+Ниже пример установки GrabVidZilla на Linux-сервер, если исходники лежат на GitHub.
+
+### Вариант A: установка в виртуальное окружение (без Docker)
+
+1) Установите git и Python 3.11+ (пример для Debian/Ubuntu):
+
+```bash
+sudo apt update
+sudo apt install -y git python3.11 python3.11-venv ffmpeg
+```
+
+2) Клонируйте репозиторий (замените `USER` и URL на свой):
+
+```bash
+cd /opt
+sudo git clone https://github.com/USER/GrabVidZilla-V2.git grabvidzilla
+cd grabvidzilla
+```
+
+3) Создайте и активируйте виртуальное окружение:
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+```
+
+4) Установите зависимости:
+
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+5) Запустите CLI или UI:
+
+- CLI меню:
+
+  ```bash
+  python -m cli.cli
+  ```
+
+- UI (Streamlit):
+
+  ```bash
+  python -m streamlit run ui/app.py --server.address=0.0.0.0 --server.port=8501
+  ```
+
+  После этого UI будет доступен по адресу `http://<IP_сервера>:8501`.
+
+### Вариант B: установка и запуск через Docker на сервере
+
+1) Установите Docker (для Ubuntu, пример):
+
+```bash
+sudo apt update
+sudo apt install -y docker.io
+sudo systemctl enable --now docker
+```
+
+2) Клонируйте репозиторий:
+
+```bash
+cd /opt
+sudo git clone https://github.com/USER/GrabVidZilla-V2.git grabvidzilla
+cd grabvidzilla
+```
+
+3) Соберите Docker-образ:
+
+```bash
+sudo docker build -t grabvidzilla .
+```
+
+4) Создайте папку для загрузок на сервере:
+
+```bash
+mkdir -p /opt/grabvidzilla-downloads
+```
+
+5) Запуск CLI в контейнере (меню, файлы в `/data` → на хосте `/opt/grabvidzilla-downloads`):
+
+```bash
+sudo docker run --rm -it \
+  -v "/opt/grabvidzilla-downloads:/data" \
+  grabvidzilla
+```
+
+6) Прямое скачивание по URL в контейнере:
+
+```bash
+sudo docker run --rm -it \
+  -v "/opt/grabvidzilla-downloads:/data" \
+  grabvidzilla "https://youtu.be/..." -o /data
+```
+
+7) Запуск UI (Streamlit) в контейнере на сервере:
+
+```bash
+sudo docker run --rm -p 8501:8501 \
+  --entrypoint streamlit \
+  -v "/opt/grabvidzilla-downloads:/app/Downloads" \
+  -v "/opt/GrabVidZilla-V2/tools:/app/tools" \
+  grabvidzilla run ui/app.py --server.address=0.0.0.0 --server.port=8501
+```
+
+После этого UI будет доступен по адресу `http://<IP_сервера>:8501`. Папка `/opt/grabvidzilla-downloads` на сервере будет использоваться как каталог загрузок.
+
+### Обновление GrabVidZilla при изменениях в GitHub
+
+Если вы обновили репозиторий на GitHub (или вышла новая версия), на сервере достаточно:
+
+#### Вариант A (venv, без Docker)
+
+```bash
+cd /opt/grabvidzilla
+git pull
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+После этого можно снова запускать CLI/UI обычным способом.
+
+#### Вариант B (Docker)
+
+```bash
+cd /opt/grabvidzilla
+sudo git pull
+sudo docker build -t grabvidzilla .
+```
+
+Если контейнеры запускались с тегом `grabvidzilla` (как в примерах выше), новые запуски автоматически будут использовать обновлённый образ.
 
 ## Структура проекта
 

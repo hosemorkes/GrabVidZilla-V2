@@ -15,6 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Рабочая директория
 WORKDIR /app
 
+# Используем /app как домашнюю директорию, чтобы UI и CLI сохраняли файлы в /app/Downloads
+ENV HOME=/app
+
 # Подготовим стандартные каталоги внутри контейнера
 RUN mkdir -p /app/Downloads /data /app/tools
 

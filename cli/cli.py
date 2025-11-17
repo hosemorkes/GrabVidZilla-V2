@@ -20,9 +20,21 @@ from core.parser import find_media_urls
 console = Console()
 
 
-def _run_download(url: str, output_path: str, cookies_path: Optional[str] = None, fmt: Optional[str] = None) -> None:
+def _run_download(
+    url: str,
+    output_path: str,
+    cookies_path: Optional[str] = None,
+    fmt: Optional[str] = None,
+) -> tuple[bool, Optional[str], float, Optional[int]]:
     """
     Выполняет загрузку одного URL, показывая прогресс через rich.Progress.
+
+    Returns:
+        Кортеж (success, file_path, elapsed_s, size_bytes):
+        - success: True при успешной загрузке, False при ошибке;
+        - file_path: полный путь к загруженному файлу (если известен);
+        - elapsed_s: примерное время скачивания в секундах;
+        - size_bytes: размер файла в байтах (если удалось определить).
     """
     import os
     import re
@@ -61,6 +73,8 @@ def _run_download(url: str, output_path: str, cookies_path: Optional[str] = None
 
         console.print(":rocket: [bold]Старт загрузки[/bold]", style="cyan")
         started_at = time.perf_counter()
+        size_bytes: Optional[int] = None
+        file_path_str: Optional[str] = None
         try:
             file_path = download_video(
                 url=url,
@@ -121,13 +135,15 @@ def _run_download(url: str, output_path: str, cookies_path: Optional[str] = None
                 size_bytes = os.path.getsize(file_path)
                 console.print(f"[dim]Размер файла: {_format_size(size_bytes)}[/dim]")
             except Exception:
-                pass
+                size_bytes = None
             console.print()  # отступ после успешного завершения
+            file_path_str = file_path
+            return True, file_path_str, float(elapsed), size_bytes
         except Exception as exc:
             # Обрабатываем исключения из core и выводим дружелюбно
             console.print(f":boom: [bold red]Ошибка[/bold red]: {exc}")
             # Не пробрасываем исключение выше, чтобы не было Aborted! и оставаться в меню
-            return
+            return False, None, 0.0, None
         finally:
             console.print()  # общий отступ после операции (успех/ошибка)
 
@@ -239,9 +255,9 @@ def _show_menu_and_handle() -> None:
             console.print()  # отступ перед возвратом к меню
             continue
         elif choice == 3:
-            # Загрузка свежих cookies в tools/cookies.txt
+            # Загрузка/обновление cookies в tools/cookies.txt c объединением записей.
             import os
-            import shutil
+            from http.cookiejar import MozillaCookieJar
 
             project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
             tools_dir = os.path.join(project_root, "tools")
@@ -249,13 +265,47 @@ def _show_menu_and_handle() -> None:
             src = click.prompt("Путь к cookies.txt (Netscape формат)", type=str)
             if not os.path.isfile(src):
                 console.print("[red]Файл не найден[/red]")
-            else:
-                dst = os.path.join(tools_dir, "cookies.txt")
-                try:
-                    shutil.copyfile(src, dst)
-                    console.print(f"[green]Cookies сохранены[/green]: {dst}")
-                except Exception as e:
-                    console.print(f"[red]Не удалось сохранить cookies[/red]: {e}")
+                console.print()
+                continue
+
+            dst = os.path.join(tools_dir, "cookies.txt")
+
+            def _load_jar(path: str) -> MozillaCookieJar:
+                jar = MozillaCookieJar()
+                if os.path.isfile(path):
+                    try:
+                        jar.load(path, ignore_discard=True, ignore_expires=True)
+                    except Exception:
+                        # Если существующий файл повреждён или не читается —
+                        # начинаем с пустого набора cookies.
+                        jar = MozillaCookieJar()
+                return jar
+
+            try:
+                # Текущие cookies (если есть)
+                existing = _load_jar(dst)
+                # Новые cookies из выбранного файла
+                incoming = MozillaCookieJar()
+                incoming.load(src, ignore_discard=True, ignore_expires=True)
+
+                # Объединяем: ключом считаем (domain, path, name).
+                by_key: dict[tuple[str, str, str], object] = {}
+                for c in existing:
+                    key = (c.domain, c.path, c.name)  # type: ignore[attr-defined]
+                    by_key[key] = c
+                for c in incoming:
+                    key = (c.domain, c.path, c.name)  # type: ignore[attr-defined]
+                    by_key[key] = c  # новые перезаписывают старые
+
+                merged = MozillaCookieJar()
+                for c in by_key.values():
+                    merged.set_cookie(c)  # type: ignore[arg-type]
+
+                merged.save(dst, ignore_discard=True, ignore_expires=True)
+                console.print(f"[green]Cookies обновлены и сохранены[/green]: {dst}")
+            except Exception as e:
+                console.print(f"[red]Не удалось объединить cookies[/red]: {e}")
+
             console.print()
             continue
         elif choice == 4:
@@ -299,6 +349,18 @@ def _show_menu_and_handle() -> None:
                     console.print(f"  {len(indexed)+1}. {label}: {u}")
                     indexed.append((label, u))
 
+            if not indexed:
+                console.print("[yellow]Не удалось собрать список ссылок для загрузки.[/yellow]")
+                console.print()
+                continue
+
+            total_items = len(indexed)
+            all_option = total_items + 1
+
+            console.print()
+            console.print(f"[cyan]{all_option}. Скачать все найденные[/cyan]")
+            console.print("[cyan]0. Отмена[/cyan]")
+
             try:
                 choice_idx = click.prompt(
                     "Выберите номер видео для загрузки", type=int, default=1
@@ -308,7 +370,82 @@ def _show_menu_and_handle() -> None:
                 console.print()
                 continue
 
-            if not (1 <= choice_idx <= len(indexed)):
+            if choice_idx == 0:
+                console.print("[dim]Загрузка отменена пользователем.[/dim]")
+                console.print()
+                continue
+
+            if choice_idx == all_option:
+                # Скачиваем все найденные ссылки по очереди с небольшим отчётом в конце
+                import os
+                import time
+
+                results: list[dict] = []
+                batch_started = time.perf_counter()
+
+                for label, selected_url in indexed:
+                    console.print(f"[cyan]Скачиваем {label}[/cyan]")
+                    success, file_path, elapsed_s, size_bytes = _run_download(
+                        url=selected_url,
+                        output_path="Downloads",
+                        cookies_path=use_cookies,
+                        fmt=None,
+                    )
+                    filename = os.path.basename(file_path) if file_path else "(нет файла)"
+                    results.append(
+                        {
+                            "label": label,
+                            "url": selected_url,
+                            "success": success,
+                            "filename": filename,
+                            "elapsed_s": elapsed_s,
+                            "size_bytes": size_bytes,
+                        }
+                    )
+
+                total_elapsed = time.perf_counter() - batch_started
+                total_bytes = sum(r["size_bytes"] or 0 for r in results)
+
+                def _fmt_size(num_bytes: int) -> str:
+                    units = ["Б", "КБ", "МБ", "ГБ", "ТБ"]
+                    i = 0
+                    v = float(num_bytes)
+                    while v >= 1024.0 and i < len(units) - 1:
+                        v /= 1024.0
+                        i += 1
+                    if units[i] in ("МБ", "ГБ", "ТБ"):
+                        return f"{v:.1f} {units[i]}"
+                    return f"{int(v)} {units[i]}"
+
+                def _fmt_duration(seconds: float) -> str:
+                    if seconds >= 60.0:
+                        m = int(seconds // 60)
+                        s = seconds - (m * 60)
+                        if s >= 10:
+                            return f"{m} мин {int(s)} сек"
+                        return f"{m} мин {s:.1f} сек"
+                    return f"{seconds:.1f} сек"
+
+                console.print()
+                console.print("[bold]Отчёт по пакетной загрузке:[/bold]")
+                for r in results:
+                    status = "[green]успешно[/green]" if r["success"] else "[red]ошибка[/red]"
+                    size_text = (
+                        _fmt_size(r["size_bytes"]) if r["size_bytes"] is not None else "n/a"
+                    )
+                    console.print(
+                        f"- {r['label']}: {status}, файл: {r['filename']}, "
+                        f"время: {_fmt_duration(r['elapsed_s'])}, размер: {size_text}"
+                    )
+
+                console.print(
+                    f"[bold]Итого[/bold]: {_fmt_duration(total_elapsed)}, "
+                    f"суммарный размер: {_fmt_size(total_bytes)}"
+                )
+                console.print()
+                continue
+
+            if not (1 <= choice_idx <= total_items):
                 console.print("[red]Номер вне диапазона.[/red]")
                 console.print()
                 continue
