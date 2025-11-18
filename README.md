@@ -248,6 +248,37 @@ docker run --rm -it grabvidzilla
 docker run --rm grabvidzilla --help
 ```
 
+### Запуск через Docker Compose
+
+В репозитории есть файл `docker-compose.yml`, который упрощает запуск CLI и UI, а также заранее создаёт общую Docker-сеть для интеграции с другими контейнерами.
+
+- **Тома и папки:**
+  - Локальная папка `Downloads` монтируется в контейнер как `/app/Downloads` и `/data` — сюда сохраняются все загруженные видео.
+  - Локальная папка `tools` монтируется в контейнер как `/app/tools` — внутри ожидается файл `cookies.txt` для авторизации на сайтах (формат Netscape).
+  - Если папок `Downloads` или `tools` нет, создайте их рядом с `docker-compose.yml`.
+
+- **Сеть:**
+  - В `docker-compose.yml` объявлена пользовательская сеть `grabvidzilla-net`.
+  - Оба сервиса (`grabvidzilla-cli` и `grabvidzilla-ui`) подключены к этой сети.
+  - Любые другие контейнеры, запущенные через docker-compose или вручную с опцией `--network grabvidzilla-net`, смогут обращаться к GrabVidZilla по имени сервиса (например, `grabvidzilla-cli`).
+
+- **Запуск CLI (интерактивное меню):**
+  - Собрать и запустить контейнер с меню:
+    ```bash
+    docker compose up grabvidzilla-cli
+    ```
+  - Файлы будут сохраняться в локальную папку `Downloads` рядом с проектом.
+
+- **Запуск UI (Streamlit):**
+  - Запустить UI:
+    ```bash
+    docker compose up grabvidzilla-ui
+    ```
+  - Интерфейс будет доступен по адресу `http://localhost:8501`.
+  - Скачанные файлы также будут складываться в локальную папку `Downloads`.
+
+При необходимости вы можете добавить другие сервисы в этот же `docker-compose.yml` и подключить их к сети `grabvidzilla-net` для взаимодействия с GrabVidZilla.
+
 ### Где Docker хранит данные по умолчанию
 - Windows (Docker Desktop с WSL2): виртуальный диск в `%USERPROFILE%\AppData\Local\Docker\wsl\data\ext4.vhdx`
 - Linux: `/var/lib/docker`
@@ -326,18 +357,17 @@ pip install -r requirements.txt
 
   После этого UI будет доступен по адресу `http://<IP_сервера>:8501`.
 
-### Вариант B: установка и запуск через Docker на сервере
+### Вариант B: установка и запуск через Docker Compose на сервере
 
-1) Установите Docker (для Ubuntu, пример):
+1) Установите Docker и docker-compose-plugin (для Ubuntu, пример):
 
 ```bash
 sudo apt update   # обновляет локальный список пакетов из репозиториев
-sudo apt install -y docker.io  # Эта команда устанавливает пакет из стандартных репозиториев Ubuntu
-sudo systemctl enable --now docker # Команда выполняет сразу два действия: enable — включает автоматический запуск службы Docker при загрузке системы.; --now — немедленно запускает службу Docker, без ожидания следующей перезагрузки.
-
+sudo apt install -y docker.io docker-compose-plugin
+sudo systemctl enable --now docker  # включает автозапуск Docker и сразу его запускает
 ```
 
-2) Клонируйте репозиторий:
+2) Клонируйте репозиторий (замените `USER` и URL на свой):
 
 ```bash
 cd /opt
@@ -345,45 +375,33 @@ sudo git clone https://github.com/USER/GrabVidZilla-V2.git grabvidzilla
 cd grabvidzilla
 ```
 
-3) Соберите Docker-образ:
+3) Подготовьте папки для загрузок и cookies (они будут монтироваться в контейнеры):
 
 ```bash
-sudo docker build -t grabvidzilla .
+mkdir -p Downloads tools
 ```
 
-4) Создайте папку для загрузок на сервере:
+4) Соберите образы через docker-compose (используется локальный `Dockerfile`):
 
 ```bash
-mkdir -p /opt/grabvidzilla-downloads
+sudo docker compose build
 ```
 
-5) Запуск CLI в контейнере (меню, файлы в `/data` → на хосте `/opt/grabvidzilla-downloads`):
+5) Запуск CLI (интерактивное меню) на сервере:
 
 ```bash
-sudo docker run --rm -it \
-  -v "/opt/grabvidzilla-downloads:/data" \
-  grabvidzilla
+sudo docker compose run --rm grabvidzilla-cli
 ```
 
-6) Прямое скачивание по URL в контейнере:
+Файлы будут сохраняться в `/opt/grabvidzilla/Downloads` на сервере.
+
+6) Запуск UI (Streamlit) на сервере:
 
 ```bash
-sudo docker run --rm -it \
-  -v "/opt/grabvidzilla-downloads:/data" \
-  grabvidzilla "https://youtu.be/..." -o /data
+sudo docker compose up -d grabvidzilla-ui
 ```
 
-7) Запуск UI (Streamlit) в контейнере на сервере:
-
-```bash
-sudo docker run --rm -p 8501:8501 \
-  --entrypoint streamlit \
-  -v "/opt/grabvidzilla-downloads:/app/Downloads" \
-  -v "/opt/GrabVidZilla-V2/tools:/app/tools" \
-  grabvidzilla run ui/app.py --server.address=0.0.0.0 --server.port=8501
-```
-
-После этого UI будет доступен по адресу `http://<IP_сервера>:8501`. Папка `/opt/grabvidzilla-downloads` на сервере будет использоваться как каталог загрузок.
+После этого UI будет доступен по адресу `http://<IP_сервера>:8501`. Все загруженные файлы также будут складываться в `/opt/grabvidzilla/Downloads`.
 
 ### Обновление GrabVidZilla при изменениях в GitHub
 
@@ -400,15 +418,16 @@ pip install -r requirements.txt
 
 После этого можно снова запускать CLI/UI обычным способом.
 
-#### Вариант B (Docker)
+#### Вариант B (Docker / Docker Compose)
 
 ```bash
 cd /opt/grabvidzilla
 sudo git pull
-sudo docker build -t grabvidzilla .
+sudo docker compose build
+sudo docker compose up -d grabvidzilla-ui
 ```
 
-Если контейнеры запускались с тегом `grabvidzilla` (как в примерах выше), новые запуски автоматически будут использовать обновлённый образ.
+После пересборки и перезапуска сервисов `docker compose` автоматически подхватит обновлённый образ.
 
 ## Структура проекта
 

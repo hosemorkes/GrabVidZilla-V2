@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  grabvidzilla-cli:
+    image: grabvidzilla:latest
+    build: .
+    container_name: grabvidzilla-cli
+    stdin_open: true
+    tty: true
+    working_dir: /app
+    restart: unless-stopped
+    volumes:
+      - ./Downloads:/app/Downloads
+      - ./tools:/app/tools
+    networks:
+      - grabvidzilla-net
+
+  grabvidzilla-ui:
+    image: grabvidzilla:latest
+    build: .
+    container_name: grabvidzilla-ui
+    working_dir: /app
+    entrypoint: ["streamlit"]
+    command:
+      - run
+      - ui/app.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+    environment:
+      - HOME=/app
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+    volumes:
+      - ./Downloads:/app/Downloads
+      - ./tools:/app/tools
+    networks:
+      - grabvidzilla-net
+
+networks:
+  grabvidzilla-net:
+    driver: bridge
