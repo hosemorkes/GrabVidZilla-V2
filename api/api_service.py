@@ -108,7 +108,14 @@ class TaskManager:
         self._cleanup_thread.start()
 
     # Public API
-    def start_download(self, url: str, fmt: Optional[str] = None, audio_only: bool = False) -> str:
+    def start_download(
+        self,
+        url: str,
+        fmt: Optional[str] = None,
+        audio_only: bool = False,
+        cookies_path: Optional[str] = None,
+        subtitle_lang: Optional[str] = None,
+    ) -> str:
         task_id = str(uuid4())
         with self._lock:
             running_now = len(self._running_ids)
@@ -121,6 +128,9 @@ class TaskManager:
                 audio_only=audio_only,
                 state="queued" if running_now >= self.max_concurrent else "queued",
             )
+            # Сохраняем дополнительные параметры в task для использования в _run_task
+            task._cookies_path = cookies_path  # type: ignore[attr-defined]
+            task._subtitle_lang = subtitle_lang  # type: ignore[attr-defined]
             self._tasks[task_id] = task
 
         # Submit wrapper that acquires semaphore before actual run
@@ -207,10 +217,17 @@ class TaskManager:
                 downloaded = info.get("downloaded_bytes")
                 total = info.get("total_bytes")
                 eta = None
+                percent = None
+                # Вычисляем процент из downloaded_bytes и total_bytes, если они доступны
+                if total and total > 0 and downloaded is not None and downloaded >= 0:
+                    percent = float(downloaded) / float(total) * 100.0
+                    percent = max(0.0, min(100.0, percent))
                 if speed and speed > 0 and total and downloaded is not None:
                     remaining = max(0, int(total) - int(downloaded))
                     eta = remaining / float(speed)
                 with self._lock:
+                    if percent is not None:
+                        task.progress_percent = percent
                     task.speed_bps = float(speed) if isinstance(speed, (int, float)) else None
                     task.bytes_downloaded = int(downloaded) if isinstance(downloaded, int) else None
                     task.total_bytes = int(total) if isinstance(total, int) else None
@@ -219,6 +236,8 @@ class TaskManager:
                     task.updated_at = datetime.utcnow()
 
             # For audio_only=True — формат из API может игнорироваться (решение на уровне API)
+            cookies_path = getattr(task, "_cookies_path", None)
+            subtitle_lang = getattr(task, "_subtitle_lang", None)
             result_path = download_video(
                 url=task.url,
                 output_path=self.downloads_dir,
@@ -227,6 +246,8 @@ class TaskManager:
                 cancel_event=task._cancel_event,
                 format=task.requested_format if not task.audio_only else None,
                 audio_only=task.audio_only,
+                cookies_path=cookies_path,
+                subtitle_lang=subtitle_lang,
             )
             with self._lock:
                 task.file_path = result_path
@@ -291,5 +312,4 @@ class TaskManager:
                     return not vcodec or vcodec == "none"
                 return True
         return False
-
 

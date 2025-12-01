@@ -6,7 +6,10 @@
 
 - 🎥 Загрузка видео с множества платформ (через yt-dlp)
 - 💻 CLI интерфейс (click + rich): прогресс-бар, скорость скачивания, цветные сообщения и эмодзи
-- 🖥️ Графический интерфейс (Streamlit): анализ форматов, выбор качества и субтитров, прогресс и кнопка скачивания файла в браузере
+  - Локальный CLI (`cli/cli.py`) — работает напрямую с ядром
+  - API-клиент (`cli/cli_api_client.py`) — работает через HTTP API
+- 🖥️ Графический интерфейс (Streamlit): анализ форматов, выбор качества и субтитров, прогресс и кнопка скачивания файла в браузере (работает через HTTP API)
+- 🌐 REST API (FastAPI): централизованная система скачивания через TaskManager с ограничением параллелизма и очередью задач
 - 🔎 Поиск видео на веб‑страницах в CLI (HLS m3u8 и прямые ссылки на файлы) с последующей загрузкой
 - 🧩 Поддержка cookies.txt (Netscape) для приватных/региональных видео (VK/YouTube и др.)
 - 🐳 Docker-образ (включает ffmpeg)
@@ -40,27 +43,34 @@ pip install -r requirements.txt
 
 ## Использование: UI (Streamlit)
 
+**Важно:** UI работает через HTTP API. Перед запуском UI необходимо запустить API сервер (см. раздел REST API).
+
 Локальный запуск из корня проекта (после установки зависимостей):
 
 ```bash
+# 1. Сначала запустите API сервер (в отдельном терминале)
+uvicorn api.api_main:app --reload --host 0.0.0.0 --port 8000
+
+# 2. Затем запустите UI (в другом терминале)
 # вариант A
-streamlit run ui/app.py
+streamlit run ui/ui_app.py
 
 # вариант B (эквивалентно)
-python -m streamlit run ui/app.py
+python -m streamlit run ui/ui_app.py
 ```
 
 Откроется интерфейс по адресу `http://localhost:8501`.
 
 - Основной поток работы:
   - Введите URL видео.
-  - Нажмите «Analysis» — получим метаданные, список доступных качеств и языков субтитров.
+  - Нажмите «Analysis» — получим метаданные, список доступных качеств и языков субтитров (через `GET /analyze`).
   - Выберите качество и (опционально) язык субтитров.
-  - Нажмите «Download» — пойдёт загрузка с прогресс‑баром и скоростью.
-  - По завершении появится кнопка «Скачать файл в браузере» и файл будет сохранён на диск.
+  - Нажмите «Download» — отправляется запрос на скачивание (`POST /downloads`), затем отслеживается прогресс через `GET /downloads/{id}`.
+  - По завершении появится кнопка «Скачать файл в браузере» (через `GET /downloads/{id}/file`) и файл будет сохранён на диск.
 - Cookies:
   - Разверните «Advanced (cookies)» и загрузите файл формата Netscape (`cookies.txt`).
   - Если файл уже лежит в `tools/cookies.txt`, UI подхватит его автоматически.
+  - Cookies передаются в API через параметр `cookies_path` в запросах.
 - Кнопка «Stop server» останавливает процесс Streamlit (аналог `Ctrl+C`).
 
 Особенности выбора формата в UI:
@@ -69,9 +79,11 @@ python -m streamlit run ui/app.py
 - Если запрошенный формат недоступен, выполняется фолбэк на `best`.
 
 Где сохраняются файлы (UI):
-- По умолчанию — в системную папку пользователя `~/Downloads` (Windows/Linux/macOS).
+- По умолчанию — в папку, указанную в `DOWNLOADS_DIR` переменной окружения API (по умолчанию `downloads`).
 
 ## Использование: CLI
+
+### Локальный CLI (работает напрямую с ядром)
 
 Запуск из корня проекта:
 ```bash
@@ -94,12 +106,49 @@ python -m cli.cli "https://vkvideo.ru/..." --cookies tools\cookies.txt
 - Отображаем:
   - Прогресс (0..100%)
   - Текущую скорость (Б/с, КБ/с, МБ/с)
-  - По завершении — имя файла и время скачивания
+  - По завершении — имя файла, время скачивания и размер файла
 
 - Путь по умолчанию:
   - Меню: `Downloads` в корне проекта
   - CLI: `-o/--output`, если не задано — также `Downloads`
-  - UI (Streamlit): папка загрузок пользователя (`~/Downloads`)
+
+### API-клиент (работает через HTTP API)
+
+**Важно:** Перед запуском API-клиента необходимо запустить API сервер (см. раздел REST API).
+
+Запуск из корня проекта:
+```bash
+python -m cli.cli_api_client
+```
+
+- Меню аналогично локальному CLI, но все операции выполняются через REST API:
+  - 1. Скачать видео (через `POST /downloads` и отслеживание прогресса)
+  - 2. help
+  - 3. Загрузить cookies (объединение с существующими в `tools/cookies.txt`)
+  - 4. Найти видео на странице (пока не реализовано через API)
+  - 0. Выход
+
+- Переменные окружения:
+  - `GVZ_API_URL` — URL API сервера (по умолчанию `http://localhost:8000`)
+
+- Примеры:
+```bash
+# С API на localhost:8000 (по умолчанию)
+python -m cli.cli_api_client
+
+# С API на другом адресе
+GVZ_API_URL=http://api.example.com:8000 python -m cli.cli_api_client
+```
+
+- Отображаем:
+  - Прогресс (0..100%) через периодический опрос API
+  - Текущую скорость (Б/с, КБ/с, МБ/с)
+  - По завершении — имя файла, время скачивания и размер файла
+
+- Преимущества API-клиента:
+  - Единый лимит параллельных загрузок (`MAX_CONCURRENT_DOWNLOADS`)
+  - Единая очередь задач
+  - Можно использовать несколько клиентов одновременно
 
 #### Поиск видео на странице (пункт 4 меню CLI)
 
@@ -195,7 +244,7 @@ docker run --rm -p 8501:8501 `
   -e HOME=/app `
   -v "D:\temp\Downloads:/app/Downloads" `
   -v "D:\ProjectsLab\GrabVidZilla-V2\tools:/app/tools" `
-  grabvidzilla run ui/app.py --server.address=0.0.0.0 --server.port=8501
+  grabvidzilla run ui/ui_app.py --server.address=0.0.0.0 --server.port=8501
 ```
 
 - Linux/macOS (пример, сохраняем в `~/temp/Downloads`):
@@ -204,7 +253,7 @@ docker run --rm -p 8501:8501 \
   --entrypoint streamlit \
   -v "$HOME/temp/Downloads:/app/Downloads" \
   -v "$(pwd)/tools:/app/tools" \
-  grabvidzilla run ui/app.py --server.address=0.0.0.0 --server.port=8501
+  grabvidzilla run ui/ui_app.py --server.address=0.0.0.0 --server.port=8501
 ```
 
 Пояснения:
@@ -352,7 +401,7 @@ pip install -r requirements.txt
 - UI (Streamlit):
 
   ```bash
-  python -m streamlit run ui/app.py --server.address=0.0.0.0 --server.port=8501
+  python -m streamlit run ui/ui_app.py --server.address=0.0.0.0 --server.port=8501
   ```
 
   После этого UI будет доступен по адресу `http://<IP_сервера>:8501`.
@@ -378,7 +427,7 @@ cd grabvidzilla
 3) Подготовьте папки для загрузок и cookies (они будут монтироваться в контейнеры):
 
 ```bash
-mkdir -p Downloads tools
+sudo mkdir -p Downloads tools
 ```
 
 4) Соберите образы через docker-compose (используется локальный `Dockerfile`):
@@ -470,7 +519,7 @@ grabvidzilla/
     - `user_is_admin(user)` — проверка прав администратора (включая `root`);
     - `user_is_root(user)` — проверка прав суперпользователя;
     - `user_to_dict(user)` — удобное представление для UI/API.
-- UI-обвязка: `ui/auth_ui.py`
+- UI-обвязка: `ui/ui_auth.py`
   - Блок аутентификации (логин/регистрация):
     - форма входа (`email` + `password`);
     - форма регистрации (`email`, `name`, `password`, `phone`).
@@ -481,14 +530,14 @@ grabvidzilla/
     - `require_login()` — требует авторизацию для доступа к разделу (иначе показывает формы и останавливает страницу);
     - `require_admin()` — требует права администратора;
     - `logout()` — выход из аккаунта.
-- В `ui/app.py`:
-  - В начале `main()` вызывается `auth_ui.render_auth_block()` и `auth_ui.require_login()`, чтобы доступ к функционалу загрузки был только у авторизованных пользователей.
+- В `ui/ui_app.py`:
+  - В начале `main()` вызывается `ui_auth.render_auth_block()` и `ui_auth.require_login()`, чтобы доступ к функционалу загрузки был только у авторизованных пользователей.
 
 > **Важно:** пароли хранятся без хеширования. Это сделано специально для простоты локальной отладки и возможности менять пароль напрямую через SQLite (`data/app.db`). Для реальных проектов настоятельно рекомендуется использовать безопасное хеширование паролей.
 
 #### Создание первого пользователя
 
-При самом первом запуске UI (`streamlit run ui/app.py`), если в базе ещё нет ни одного пользователя, вы увидите сообщение с инструкцией создать первого пользователя через CLI.
+При самом первом запуске UI (`streamlit run ui/ui_app.py`), если в базе ещё нет ни одного пользователя, вы увидите сообщение с инструкцией создать первого пользователя через CLI.
 
 Сделайте это один раз:
 
@@ -507,8 +556,17 @@ python scripts/create_first_user.py
 
 - Слои:
   - `core/` — бизнес-логика, не импортирует `cli`/`ui`
-  - `cli/` — только CLI, импортирует `core`
-  - `ui/` — только GUI, импортирует `core`
+  - `cli/cli.py` — локальный CLI, импортирует `core` напрямую
+  - `cli/cli_api_client.py` — API-клиент, работает через HTTP API
+  - `ui/` — GUI (Streamlit), работает через HTTP API
+  - `api/` — REST API (FastAPI), импортирует `core`, централизованный сервис скачивания
+
+- **Централизованная система скачивания:**
+  - Все новые скачивания проходят через FastAPI + TaskManager
+  - Единый лимит параллельных загрузок (`MAX_CONCURRENT_DOWNLOADS`)
+  - Единая очередь задач
+  - `cli/cli.py` остаётся для локальной работы (напрямую с `core`)
+  - `cli/cli_api_client.py` и `ui/ui_app.py` работают через HTTP API
 
 - API:
 ```python
@@ -550,7 +608,7 @@ def analyze_video(
 Локальный запуск из корня проекта (после установки зависимостей):
 
 ```bash
-uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn api.api_main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 Документация (FastAPI):
@@ -564,22 +622,48 @@ uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 - GET `/health`
   - Ответ: `{"status": "ok"}`
 
-- GET `/formats?url=<HttpUrl>`
+- GET `/formats?url=<HttpUrl>&cookies_path=<str>`
   - Возвращает подробный `info` от yt-dlp (включая отфильтрованные `formats`).
+  - Параметры:
+    - `url` (обязательный) — URL видео для анализа
+    - `cookies_path` (опциональный) — путь к cookies.txt (Netscape формат)
   - Коды ошибок: `400` (невалидный URL), `422` (ошибка извлечения форматов).
+
+- GET `/analyze?url=<HttpUrl>&cookies_path=<str>`
+  - Возвращает структурированные данные для UI/CLI:
+    ```json
+    {
+      "info": {...},
+      "qualities": ["2160p", "1080p", "720p", "audio only"],
+      "subtitle_langs": ["en", "ru", ...]
+    }
+    ```
+  - Параметры:
+    - `url` (обязательный) — URL видео для анализа
+    - `cookies_path` (опциональный) — путь к cookies.txt (Netscape формат)
+  - Коды ошибок: `400` (невалидный URL), `422` (ошибка анализа).
 
 - POST `/downloads`
   - Тело запроса (JSON):
     ```json
     {
       "url": "https://www.youtube.com/watch?v=...",
-      "format": "136+140",
-      "audio_only": false
+      "format": "bv*[height<=1080]+ba/best[height<=1080]",
+      "audio_only": false,
+      "cookies_path": "/path/to/cookies.txt",
+      "subtitle_lang": "ru"
     }
     ```
+  - Параметры:
+    - `url` (обязательный) — URL видео для скачивания
+    - `format` (опциональный) — селектор формата или конкретный format_id (игнорируется если `audio_only=true`)
+    - `audio_only` (опциональный, по умолчанию `false`) — загрузить только аудио
+    - `cookies_path` (опциональный) — путь к cookies.txt (Netscape формат)
+    - `subtitle_lang` (опциональный) — код языка субтитров для встраивания (например, `"ru"`, `"en"`)
   - Примечания:
     - Если `audio_only=true`, параметр `format` игнорируется.
-    - Если указан `format`, API проверяет его доступность для данного URL; при недоступности вернёт `422 format_unavailable`.
+    - Если указан `format` как конкретный format_id (не селектор), API проверяет его доступность; при недоступности вернёт `422 format_unavailable`.
+    - Селекторы формата (содержат `*`, `+`, `[`, `]`, `/`) валидируются yt-dlp автоматически.
   - Ответ: `201 Created`
     ```json
     { "id": "TASK_UUID" }
@@ -661,7 +745,7 @@ curl -X DELETE http://localhost:8000/downloads/TASK_UUID
 Примечания:
 - Прогресс обновляется с шагом `PROGRESS_UPDATE_INTERVAL_MS`, поэтому при частом опросе клиента значения могут меняться не на каждый запрос.
 - Если `QUEUE_STRATEGY=reject`, при попытке стартовать новую загрузку сверх лимита API вернёт `429` с `max_concurrent`.
-- CORS открыт ко всем доменам — при необходимости ограничьте в `api.main`.
+- CORS открыт ко всем доменам — при необходимости ограничьте в `api.api_main`.
 
 ### Интеграционные подсказки
 
@@ -674,7 +758,7 @@ curl -X DELETE http://localhost:8000/downloads/TASK_UUID
 - 403 / “Failed to parse JSON”: используйте актуальные cookies, попробуйте другой аккаунт/регион.
 - “ERROR: …” дублируется: в CLI это подавлено, если видите — проверьте запуск из корня проекта.
 - yt-dlp устарел/сломался: обновите `yt-dlp` в venv (`pip install -U yt-dlp`) или пересоберите Docker.
-- UI не открывается/порт занят: запустите на другом порту, например `streamlit run ui/app.py --server.port=8502` и откройте `http://localhost:8502`.
+- UI не открывается/порт занят: запустите на другом порту, например `streamlit run ui/ui_app.py --server.port=8502` и откройте `http://localhost:8502`.
 
 ## Лицензия
 

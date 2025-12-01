@@ -27,11 +27,16 @@ RUN mkdir -p /app/Downloads /data /app/tools
 # Копирование файлов зависимостей
 COPY requirements.txt .
 
-# Установка зависимостей
+# Установка зависимостей (включая yt-dlp из requirements.txt)
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копирование кода приложения
-COPY . .
+# Копирование всего проекта (core, api, ui, cli)
+COPY core/ ./core/
+COPY api/ ./api/
+COPY ui/ ./ui/
+COPY cli/ ./cli/
+COPY scripts/ ./scripts/
+COPY data/ ./data/
 
 # Объявим точки монтирования (необязательно, но удобно как подсказка)
 VOLUME ["/app/Downloads", "/data", "/app/tools"]

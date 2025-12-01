@@ -371,4 +371,3 @@ def render_admin_panel() -> None:
                         db3.close()
                     st.rerun()
 
-

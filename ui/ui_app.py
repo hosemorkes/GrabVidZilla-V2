@@ -11,19 +11,17 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import sys
+import time
+import requests
 import streamlit as st
 
-# Бизнес-логика — используем только ядро
-# Добавим корень проекта в sys.path, чтобы импортировать пакет core при запуске через Streamlit
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+from ui import ui_auth
 
-from core.downloader import download_video, analyze_video
-from ui import auth_ui
+# URL API по умолчанию
+API_BASE_URL = "http://localhost:8000"
 
 
 def _get_default_downloads_dir() -> Path:
@@ -168,6 +166,8 @@ def _init_session_state() -> None:
         "selected_quality": None,
         "selected_subtitle": None,
         "last_download_path": None,
+        "current_task_id": None,
+        "download_progress": 0.0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -182,8 +182,8 @@ def main() -> None:
     _init_session_state()
 
     # Блок аутентификации (логин/регистрация/выход)
-    auth_ui.render_auth_block()
-    auth_ui.require_login()
+    ui_auth.render_auth_block()
+    ui_auth.require_login()
 
     # Профильное меню в верхнем левом углу:
     # - компактный индикатор профиля (👤 user);
@@ -201,13 +201,13 @@ def main() -> None:
                         f"`{user_info.get('email', '')}`"
                     )
                     if st.button("Выйти", key="header_logout_btn"):
-                        auth_ui.logout()
+                        ui_auth.logout()
                         st.rerun()
             # Иконка настроек только для администраторов
             if user_info.get("is_admin"):
                 with profile_cols[1]:
                     with st.popover("⚙️", use_container_width=True):
-                        auth_ui.render_admin_panel()
+                        ui_auth.render_admin_panel()
         with header_cols[1]:
             pass  # справа оставляем место под заголовок/логотип
 
@@ -413,7 +413,16 @@ def main() -> None:
         else:
             with st.spinner("Анализ видео..."):
                 try:
-                    info, qualities, subtitle_langs = analyze_video(url, cookies_path=st.session_state.get("cookies_path"))
+                    cookies_path = st.session_state.get("cookies_path")
+                    params = {"url": url}
+                    if cookies_path:
+                        params["cookies_path"] = cookies_path
+                    response = requests.get(f"{API_BASE_URL}/analyze", params=params, timeout=30)
+                    response.raise_for_status()
+                    data = response.json()
+                    info = data["info"]
+                    qualities = data["qualities"]
+                    subtitle_langs = data["subtitle_langs"]
                     st.session_state["analyzed"] = True
                     st.session_state["info"] = info
                     st.session_state["qualities"] = qualities
@@ -422,6 +431,16 @@ def main() -> None:
                     st.session_state["selected_quality"] = qualities[0] if qualities else "best"
                     st.session_state["selected_subtitle"] = subtitle_langs[0] if subtitle_langs else None
                     st.success("Анализ завершён.")
+                except requests.exceptions.RequestException as e:
+                    st.session_state["analyzed"] = False
+                    error_msg = str(e)
+                    if hasattr(e, "response") and e.response is not None:
+                        try:
+                            detail = e.response.json().get("detail", error_msg)
+                            error_msg = detail
+                        except Exception:
+                            error_msg = f"HTTP {e.response.status_code}: {error_msg}"
+                    st.error(f"Не удалось проанализировать URL: {error_msg}")
                 except Exception as e:
                     st.session_state["analyzed"] = False
                     st.error(f"Не удалось проанализировать URL: {e}")
@@ -484,78 +503,109 @@ def main() -> None:
         # Прежняя стратегия: гибкая строка формата по выбранному качеству
         fmt = _build_format_selector(selected_quality)
 
-        # Папка загрузок пользователя
-        downloads_dir = _get_default_downloads_dir()
-
-        # Прогресс-бар и текстовые индикаторы
-        progress_bar = st.progress(0, text="Начало загрузки...")
-        status_placeholder = st.empty()
-        speed_placeholder = st.empty()
-
-        def on_progress(percent: float) -> None:
-            progress_bar.progress(int(percent), text=f"Загрузка: {percent:.1f}%")
-
-        def on_progress_info(info: dict) -> None:
-            downloaded = info.get("downloaded_bytes")
-            total = info.get("total_bytes")
-            spd = info.get("speed")
-            status_placeholder.info(
-                f"{_format_human_size(downloaded)} из {_format_human_size(total)}"
-            )
-            speed_placeholder.caption(f"Скорость: {_format_human_speed(spd)}")
-
         try:
-            with st.spinner("Загружаем файл..."):
+            # Отправляем запрос на скачивание через API
+            payload = {
+                "url": st.session_state["url"],
+                "format": fmt if selected_quality != "audio only" else None,
+                "audio_only": (selected_quality == "audio only"),
+            }
+            cookies_path = st.session_state.get("cookies_path")
+            if cookies_path:
+                payload["cookies_path"] = cookies_path
+            subtitle_lang = st.session_state.get("selected_subtitle")
+            if subtitle_lang:
+                payload["subtitle_lang"] = subtitle_lang
+
+            response = requests.post(f"{API_BASE_URL}/downloads", json=payload, timeout=10)
+            response.raise_for_status()
+            task_data = response.json()
+            task_id = task_data["id"]
+            st.session_state["current_task_id"] = task_id
+            st.success(f"Загрузка начата (ID: {task_id[:8]}...)")
+        except requests.exceptions.RequestException as e:
+            error_msg = str(e)
+            if hasattr(e, "response") and e.response is not None:
                 try:
-                    filepath = download_video(
-                        url=st.session_state["url"],
-                        output_path=str(downloads_dir),
-                        progress_callback=on_progress,
-                        progress_info_callback=on_progress_info,
-                        cookies_path=st.session_state.get("cookies_path"),
-                        format=fmt,
-                        audio_only=(selected_quality == "audio only"),
-                        subtitle_lang=st.session_state.get("selected_subtitle"),
+                    detail = e.response.json().get("detail", error_msg)
+                    error_msg = detail
+                except Exception:
+                    error_msg = f"HTTP {e.response.status_code}: {error_msg}"
+            st.error(f"Ошибка запуска загрузки: {error_msg}")
+
+    # Отслеживание прогресса загрузки
+    if st.session_state.get("current_task_id"):
+        task_id = st.session_state["current_task_id"]
+        try:
+            response = requests.get(f"{API_BASE_URL}/downloads/{task_id}", timeout=5)
+            response.raise_for_status()
+            task_status = response.json()
+
+            state = task_status.get("state", "unknown")
+            progress_percent = task_status.get("progress_percent", 0.0)
+            filename = task_status.get("filename")
+            error = task_status.get("error")
+
+            # Прогресс-бар
+            progress_bar = st.progress(
+                int(progress_percent),
+                text=f"Загрузка: {progress_percent:.1f}% ({state})"
+            )
+
+            # Детали прогресса
+            status_cols = st.columns(3)
+            with status_cols[0]:
+                downloaded = task_status.get("bytes_downloaded")
+                total = task_status.get("total_bytes")
+                st.info(f"{_format_human_size(downloaded)} / {_format_human_size(total)}")
+            with status_cols[1]:
+                speed = task_status.get("speed_bps")
+                st.caption(f"Скорость: {_format_human_speed(speed)}")
+            with status_cols[2]:
+                eta = task_status.get("eta_s")
+                if eta:
+                    st.caption(f"Осталось: {eta:.0f} сек")
+
+            if state == "completed":
+                progress_bar.progress(100, text="Готово ✅")
+                st.success(f"Файл загружен: {filename}")
+                st.session_state["last_download_path"] = filename
+                st.session_state["current_task_id"] = None
+
+                # Кнопка скачать через браузер
+                try:
+                    file_response = requests.get(
+                        f"{API_BASE_URL}/downloads/{task_id}/file",
+                        timeout=30,
+                        stream=True
+                    )
+                    file_response.raise_for_status()
+                    st.download_button(
+                        label="Скачать файл в браузере",
+                        data=file_response.content,
+                        file_name=filename or "video",
+                        mime="application/octet-stream",
                     )
                 except Exception as e:
-                    # Фолбэк, если запрошенный формат недоступен — возьмём best
-                    msg = str(e).lower()
-                    if "requested format is not available" in msg or "no such format" in msg:
-                        filepath = download_video(
-                            url=st.session_state["url"],
-                            output_path=str(downloads_dir),
-                            progress_callback=on_progress,
-                            progress_info_callback=on_progress_info,
-                            cookies_path=st.session_state.get("cookies_path"),
-                            format="best",
-                            audio_only=False,
-                            subtitle_lang=st.session_state.get("selected_subtitle"),
-                        )
-                    else:
-                        raise
-            st.session_state["last_download_path"] = filepath
-            progress_bar.progress(100, text="Готово ✅")
+                    st.warning(f"Не удалось подготовить файл для скачивания: {e}")
 
-            st.success(f"Файл сохранён: {filepath}")
+            elif state == "failed":
+                progress_bar.progress(0, text="Ошибка ❌")
+                st.error(f"Ошибка загрузки: {error or 'Неизвестная ошибка'}")
+                st.session_state["current_task_id"] = None
 
-            # Кнопка скачать через браузер
-            try:
-                file_path = Path(filepath)
-                if file_path.exists():
-                    with file_path.open("rb") as f:
-                        st.download_button(
-                            label="Скачать файл в браузере",
-                            data=f,
-                            file_name=file_path.name,
-                            mime="application/octet-stream",
-                        )
-                else:
-                    st.warning("Не удалось найти файл для скачивания в браузере.")
-            except Exception:
-                st.warning("Не удалось подготовить файл для скачивания в браузере.")
+            elif state in ("queued", "running"):
+                # Автоматически обновляем страницу для обновления прогресса
+                time.sleep(0.5)
+                st.rerun()
 
-        except Exception as e:
-            st.error(f"Ошибка загрузки: {e}")
+            elif state == "cancelled":
+                st.warning("Загрузка отменена")
+                st.session_state["current_task_id"] = None
+
+        except requests.exceptions.RequestException as e:
+            st.error(f"Ошибка получения статуса загрузки: {e}")
+            st.session_state["current_task_id"] = None
 
 
 if __name__ == "__main__":

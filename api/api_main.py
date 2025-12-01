@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
 
-from api.service import (
+from api.api_service import (
     TaskManager,
     TaskNotFound,
     InvalidTaskState,
@@ -16,7 +16,7 @@ from api.service import (
     FileNotReady,
     FileMissing,
 )
-from core.downloader import probe_video
+from core.downloader import probe_video, analyze_video
 
 
 # ENV config (прямо тут, по ТЗ)
@@ -55,6 +55,8 @@ class StartDownloadRequest(BaseModel):
     url: HttpUrl
     format: Optional[str] = None
     audio_only: bool = False
+    cookies_path: Optional[str] = None
+    subtitle_lang: Optional[str] = None
 
 
 class StartDownloadResponse(BaseModel):
@@ -116,14 +118,41 @@ async def health() -> dict[str, str]:
 
 
 @app.get("/formats")
-async def get_formats(url: HttpUrl = Query(...)) -> dict[str, Any]:
+async def get_formats(
+    url: HttpUrl = Query(...),
+    cookies_path: Optional[str] = Query(None),
+) -> dict[str, Any]:
     try:
-        info = probe_video(str(url))
+        info = probe_video(str(url), cookies_path=cookies_path)
         return info
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         # Ошибка извлечения — считаем как 422 для клиента
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.get("/analyze")
+async def analyze(
+    url: HttpUrl = Query(...),
+    cookies_path: Optional[str] = Query(None),
+) -> dict[str, Any]:
+    """
+    Анализирует видео и возвращает структурированные данные:
+    - info: метаданные ролика
+    - qualities: список качеств (например, ['2160p', '1080p', 'audio only'])
+    - subtitle_langs: список языков субтитров (например, ['en', 'ru'])
+    """
+    try:
+        info, qualities, subtitle_langs = analyze_video(str(url), cookies_path=cookies_path)
+        return {
+            "info": info,
+            "qualities": qualities,
+            "subtitle_langs": subtitle_langs,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
 
@@ -135,16 +164,27 @@ async def start_download(req: StartDownloadRequest):
         # По оговорке: игнорируем format, если audio_only=true
         fmt_to_use = None
     elif req.format:
-        ok = False
-        try:
-            ok = tm.validate_format_available(str(req.url), req.format, audio_only=False)
-        except Exception:
+        # Проверяем, является ли формат селектором (содержит *, +, [, ]) или конкретным format_id
+        # Селекторы формата валидны по определению, их не нужно проверять
+        is_selector = any(char in req.format for char in ["*", "+", "[", "]", "/"])
+        if not is_selector:
+            # Это конкретный format_id - проверяем его доступность
             ok = False
-        if not ok:
-            raise HTTPException(status_code=422, detail="format_unavailable")
+            try:
+                ok = tm.validate_format_available(str(req.url), req.format, audio_only=False)
+            except Exception:
+                ok = False
+            if not ok:
+                raise HTTPException(status_code=422, detail="format_unavailable")
 
     try:
-        task_id = tm.start_download(str(req.url), fmt=fmt_to_use, audio_only=req.audio_only)
+        task_id = tm.start_download(
+            str(req.url),
+            fmt=fmt_to_use,
+            audio_only=req.audio_only,
+            cookies_path=req.cookies_path,
+            subtitle_lang=req.subtitle_lang,
+        )
         return StartDownloadResponse(id=task_id)
     except TooManyActiveDownloads as e:
         # Если стратегия reject — отдаём 429
@@ -187,5 +227,4 @@ async def get_downloaded_file(task_id: str):
         raise HTTPException(status_code=500, detail="file_missing")
     except TaskNotFound:
         raise HTTPException(status_code=404, detail="task_not_found")
-
 
