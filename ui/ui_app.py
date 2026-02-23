@@ -168,6 +168,20 @@ def _init_session_state() -> None:
         "last_download_path": None,
         "current_task_id": None,
         "download_progress": 0.0,
+        "media_search_url": "",
+        "media_search_results": None,
+        "media_search_error": None,
+        "media_search_use_browser": True,
+        "media_search_proxy_server": "",
+        "media_search_proxy_username": "",
+        "media_search_proxy_password": "",
+        "media_search_translations": [],
+        "media_search_selected_translation_index": None,
+        "media_search_selected_translation_hash": None,
+        "media_search_selected_translation_name": None,
+        "media_search_streams": [],
+        "media_search_selected_quality_index": None,
+        "media_search_selected_quality_label": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -569,6 +583,9 @@ def main() -> None:
             if state == "completed":
                 progress_bar.progress(100, text="Готово ✅")
                 st.success(f"Файл загружен: {filename}")
+                checksum_hex = task_status.get("checksum_sha256")
+                if checksum_hex:
+                    st.caption(f"SHA-256: `{checksum_hex}`")
                 st.session_state["last_download_path"] = filename
                 st.session_state["current_task_id"] = None
 
@@ -606,6 +623,288 @@ def main() -> None:
         except requests.exceptions.RequestException as e:
             st.error(f"Ошибка получения статуса загрузки: {e}")
             st.session_state["current_task_id"] = None
+
+    st.divider()
+
+    with st.expander("🔍 Найти медиа-ссылки на странице", expanded=False):
+        media_url = st.text_input(
+            "URL страницы",
+            key="media_search_url",
+            placeholder="https://example.com/page",
+        )
+        use_browser_on_empty = st.checkbox(
+            "Использовать Playwright, если статический парсер ничего не нашёл",
+            key="media_search_use_browser",
+        )
+
+        proxy_cols = st.columns(3)
+        with proxy_cols[0]:
+            proxy_server = st.text_input(
+                "Прокси сервер",
+                key="media_search_proxy_server",
+                placeholder="http://host:3128",
+                help="Оставьте пустым, чтобы использовать значения из переменных окружения API.",
+            )
+        with proxy_cols[1]:
+            proxy_username = st.text_input(
+                "Прокси логин",
+                key="media_search_proxy_username",
+                placeholder="user",
+            )
+        with proxy_cols[2]:
+            proxy_password = st.text_input(
+                "Прокси пароль",
+                key="media_search_proxy_password",
+                type="password",
+            )
+
+        if st.button("Искать медиа-ссылки", key="media_search_button"):
+            if not media_url.strip():
+                st.warning("Введите URL страницы для поиска.")
+            else:
+                with st.spinner("Ищем ссылки..."):
+                    params = {
+                        "url": media_url.strip(),
+                        "use_browser": "false",
+                        "fallback_to_browser": "false",
+                    }
+                    cookies_path = st.session_state.get("cookies_path")
+                    if cookies_path:
+                        params["cookies_path"] = cookies_path
+
+                    translations = st.session_state.get("media_search_translations") or []
+                    selected_idx = st.session_state.get("media_search_selected_translation_index")
+                    translation_hash = None
+                    translation_name = None
+                    if translations and selected_idx is not None and 0 <= selected_idx < len(translations):
+                        translation_hash = translations[selected_idx].get("hash")
+                        translation_name = translations[selected_idx].get("name")
+                        if translation_hash:
+                            params["translation_hash"] = translation_hash
+                    st.session_state["media_search_selected_translation_hash"] = translation_hash
+                    st.session_state["media_search_selected_translation_name"] = translation_name
+
+                    try:
+                        response = requests.get(f"{API_BASE_URL}/media", params=params, timeout=30)
+                        response.raise_for_status()
+                        data = response.json()
+                        streams = data.get("hls_streams", [])
+                        st.session_state["media_search_streams"] = streams
+                        quality_labels: list[str] = []
+                        for stream in streams:
+                            label = (stream.get("quality") or "").strip() or "Неизвестно"
+                            if label not in quality_labels:
+                                quality_labels.append(label)
+                        previous_quality_label = st.session_state.get("media_search_selected_quality_label")
+                        if quality_labels:
+                            if previous_quality_label in quality_labels:
+                                selected_quality_label = previous_quality_label
+                            else:
+                                selected_quality_label = quality_labels[0]
+                            st.session_state["media_search_selected_quality_label"] = selected_quality_label
+                            st.session_state["media_search_selected_quality_index"] = quality_labels.index(selected_quality_label)
+                        else:
+                            selected_quality_label = None
+                            st.session_state["media_search_selected_quality_label"] = None
+                            st.session_state["media_search_selected_quality_index"] = None
+
+                        if streams and st.session_state.get("media_search_selected_quality_label"):
+                            selected_quality_label = st.session_state["media_search_selected_quality_label"]
+                            filtered_streams = [
+                                stream for stream in streams
+                                if ((stream.get("quality") or "").strip() or "Неизвестно") == selected_quality_label
+                            ]
+                            if filtered_streams:
+                                hls_urls = [stream.get("url") for stream in filtered_streams if stream.get("url")]
+                                hls_urls = [u for u in hls_urls if u]
+                        else:
+                            st.session_state["media_search_selected_quality_label"] = selected_quality_label
+
+                        new_translations = data.get("translations") or []
+                        st.session_state["media_search_translations"] = new_translations
+                        if new_translations:
+                            if translation_hash:
+                                for idx, item in enumerate(new_translations):
+                                    if item.get("hash") == translation_hash:
+                                        st.session_state["media_search_selected_translation_index"] = idx
+                                        break
+                            elif st.session_state.get("media_search_selected_translation_index") is None:
+                                st.session_state["media_search_selected_translation_index"] = 0
+                            idx = st.session_state.get("media_search_selected_translation_index")
+                            if idx is not None and 0 <= idx < len(new_translations):
+                                st.session_state["media_search_selected_translation_hash"] = new_translations[idx].get("hash")
+                                st.session_state["media_search_selected_translation_name"] = new_translations[idx].get("name")
+                        else:
+                            st.session_state["media_search_selected_translation_index"] = None
+                            st.session_state["media_search_selected_translation_hash"] = None
+                            st.session_state["media_search_selected_translation_name"] = None
+
+                        if not hls_urls and not file_urls and use_browser_on_empty:
+                            params_browser = {
+                                "url": media_url.strip(),
+                                "use_browser": "true",
+                                "fallback_to_browser": "false",
+                            }
+                            if cookies_path:
+                                params_browser["cookies_path"] = cookies_path
+                            if translation_hash:
+                                params_browser["translation_hash"] = translation_hash
+                            if proxy_server.strip():
+                                params_browser["proxy_server"] = proxy_server.strip()
+                            if proxy_username.strip():
+                                params_browser["proxy_username"] = proxy_username.strip()
+                            if proxy_password.strip():
+                                params_browser["proxy_password"] = proxy_password.strip()
+
+                            response_browser = requests.get(
+                                f"{API_BASE_URL}/media",
+                                params=params_browser,
+                                timeout=60,
+                            )
+                            response_browser.raise_for_status()
+                            data_browser = response_browser.json()
+                            hls_urls = data_browser.get("hls_urls", [])
+                            file_urls = data_browser.get("file_urls", [])
+                            used_browser = data_browser.get("used_browser", True)
+                            page_title = data_browser.get("page_title") or page_title
+                            new_translations = data_browser.get("translations") or new_translations
+                            browser_streams = data_browser.get("hls_streams", [])
+                            st.session_state["media_search_streams"] = browser_streams or st.session_state.get("media_search_streams", [])
+                            quality_labels = []
+                            for stream in st.session_state["media_search_streams"]:
+                                label = (stream.get("quality") or "").strip() or "Неизвестно"
+                                if label not in quality_labels:
+                                    quality_labels.append(label)
+                            previous_quality_label = st.session_state.get("media_search_selected_quality_label")
+                            if quality_labels:
+                                if previous_quality_label in quality_labels:
+                                    selected_quality_label = previous_quality_label
+                                else:
+                                    selected_quality_label = quality_labels[0]
+                                st.session_state["media_search_selected_quality_label"] = selected_quality_label
+                                st.session_state["media_search_selected_quality_index"] = quality_labels.index(selected_quality_label)
+                                filtered_streams = [
+                                    stream for stream in st.session_state["media_search_streams"]
+                                    if ((stream.get("quality") or "").strip() or "Неизвестно") == selected_quality_label
+                                ]
+                                if filtered_streams:
+                                    hls_urls = [stream.get("url") for stream in filtered_streams if stream.get("url")]
+                                    hls_urls = [u for u in hls_urls if u]
+                            else:
+                                st.session_state["media_search_selected_quality_label"] = None
+                                st.session_state["media_search_selected_quality_index"] = None
+
+                        st.session_state["media_search_results"] = {
+                            "hls": hls_urls,
+                            "files": file_urls,
+                            "used_browser": used_browser,
+                            "title": page_title,
+                            "translation": st.session_state.get("media_search_selected_translation_name"),
+                            "quality": st.session_state.get("media_search_selected_quality_label"),
+                            "streams": st.session_state.get("media_search_streams") or [],
+                        }
+                        st.session_state["media_search_error"] = None
+                    except requests.exceptions.RequestException as exc:
+                        st.session_state["media_search_error"] = str(exc)
+                        st.session_state["media_search_results"] = None
+
+        if st.session_state.get("media_search_error"):
+            st.error(st.session_state["media_search_error"])
+
+        results = st.session_state.get("media_search_results")
+        if results:
+            if results.get("used_browser"):
+                st.info("Ссылки найдены с помощью Playwright.")
+            if results.get("title"):
+                st.subheader(results["title"])
+            if results.get("translation"):
+                st.caption(f"Перевод: {results['translation']}")
+            if results.get("quality"):
+                st.caption(f"Качество: {results['quality']}")
+
+            if results.get("hls"):
+                st.subheader("HLS (m3u8)")
+                for item in results["hls"]:
+                    st.code(item, language="")
+            else:
+                st.caption("HLS ссылки не найдены.")
+
+            if results.get("files"):
+                st.subheader("Файловые ссылки")
+                for item in results["files"]:
+                    st.code(item, language="")
+            else:
+                st.caption("Прямые ссылки на файлы не найдены.")
+
+        elif st.session_state.get("media_search_error") is None:
+            st.caption("Результаты появятся после поиска.")
+
+        translations = st.session_state.get("media_search_translations") or []
+        if translations:
+            names = [item.get("name") or f"Перевод {idx+1}" for idx, item in enumerate(translations)]
+            current_idx = st.session_state.get("media_search_selected_translation_index")
+            if current_idx is None or not (0 <= current_idx < len(names)):
+                current_idx = 0
+            selected_idx = st.selectbox(
+                "Перевод",
+                options=list(range(len(names))),
+                format_func=lambda i: names[i],
+                index=current_idx,
+            )
+            st.session_state["media_search_selected_translation_index"] = selected_idx
+            st.session_state["media_search_selected_translation_hash"] = translations[selected_idx].get("hash")
+            st.session_state["media_search_selected_translation_name"] = translations[selected_idx].get("name")
+        else:
+            st.session_state["media_search_selected_translation_index"] = None
+            st.session_state["media_search_selected_translation_hash"] = None
+            st.session_state["media_search_selected_translation_name"] = None
+
+        streams = st.session_state.get("media_search_streams") or []
+        selected_quality_label = st.session_state.get("media_search_selected_quality_label")
+
+        if st.session_state.get("media_search_error"):
+            st.error(st.session_state["media_search_error"])
+
+        results = st.session_state.get("media_search_results")
+        if results:
+            if streams:
+                target_label = (selected_quality_label or "").strip() or None
+                def _normalize_quality(label: Optional[str]) -> str:
+                    return (label or "").strip() or "Неизвестно"
+                if target_label:
+                    filtered_streams = [
+                        stream for stream in streams
+                        if _normalize_quality(stream.get("quality")) == target_label
+                    ]
+                else:
+                    filtered_streams = streams
+                if filtered_streams:
+                    results["hls"] = [stream.get("url") for stream in filtered_streams if stream.get("url")]
+                else:
+                    results["hls"] = [stream.get("url") for stream in streams if stream.get("url")]
+                results["quality"] = selected_quality_label
+
+        streams = st.session_state.get("media_search_streams") or []
+        if streams:
+            quality_labels = []
+            for stream in streams:
+                label = (stream.get("quality") or "").strip() or "Неизвестно"
+                if label not in quality_labels:
+                    quality_labels.append(label)
+            current_quality_idx = st.session_state.get("media_search_selected_quality_index")
+            if current_quality_idx is None or not (0 <= current_quality_idx < len(quality_labels)):
+                current_quality_idx = 0
+            selected_quality_idx = st.selectbox(
+                "Качество",
+                options=list(range(len(quality_labels))),
+                format_func=lambda i: quality_labels[i],
+                index=current_quality_idx,
+            )
+            st.session_state["media_search_selected_quality_index"] = selected_quality_idx
+            st.session_state["media_search_selected_quality_label"] = quality_labels[selected_quality_idx]
+        else:
+            st.session_state["media_search_selected_quality_index"] = None
+            st.session_state["media_search_selected_quality_label"] = None
 
 
 if __name__ == "__main__":

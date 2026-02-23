@@ -55,6 +55,13 @@ Downloads/
 *.mp3
 *.webm
 *.mkv
+*.flv
+*.avi
+*.m4a
+*.ogg
+*.wav
+*.m4v
+*.ts
 
 # Tests and coverage
 .pytest_cache/
@@ -65,6 +72,8 @@ htmlcov/
 # Type checkers
 .mypy_cache/
 
-# FFmpeg binary
-tools/ffmpeg/ffmpeg.exe
+# FFmpeg binaries
+tools/ffmpeg/
 
+# Временные файлы и хлам
+temp/

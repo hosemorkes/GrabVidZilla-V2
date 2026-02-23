@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 import re
+import hashlib
 
 # Простое условное логирование в файл для отладки (включается через переменную окружения GVZ_DEBUG=1)
 def _debug(message: str) -> None:
@@ -67,6 +68,27 @@ class _SilentLogger:
 
     def error(self, msg: str) -> None:  # pragma: no cover
         return
+
+
+def compute_file_checksum(file_path: str, algorithm: str = "sha256", chunk_size: int = 1024 * 1024) -> str:
+    """
+    Возвращает контрольную сумму файла. По умолчанию — SHA-256.
+
+    Args:
+        file_path: путь к файлу.
+        algorithm: алгоритм хеширования (sha256/sha1/...).
+        chunk_size: размер блока чтения.
+    """
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"Файл не найден: {file_path}")
+    hasher = hashlib.new(algorithm)
+    with open(file_path, "rb") as fh:
+        while True:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def _normalize_youtube_url(src_url: str) -> str:
@@ -150,6 +172,7 @@ def extract_info_multi(
     url: str,
     cookies_path: str | None = None,
     po_token: str | None = None,
+    cookies_from_browser: str | None = None,
 ) -> tuple[dict, str]:
     """
     Извлекает info (без скачивания) поочерёдно разными YouTube клиентами.
@@ -192,6 +215,8 @@ def extract_info_multi(
         }
         if cookies_path:
             ydl_opts["cookiefile"] = cookies_path
+        if cookies_from_browser:
+            ydl_opts["cookiesfrombrowser"] = (cookies_from_browser,)
         if client == "android" and po_token:
             ydl_opts.setdefault("extractor_args", {}).setdefault("youtube", {})["po_token"] = [po_token]
 
@@ -239,6 +264,7 @@ def download_video(
     format: str | None = None,
     audio_only: bool = False,
     subtitle_lang: str | None = None,
+    cookies_from_browser: str | None = None,
 ) -> str:
     """
     Загружает видео по URL.
@@ -367,9 +393,15 @@ def download_video(
         "geo_bypass": True,
         "retries": 3,
         "fragment_retries": 3,
+        # Оптимизации для ускорения скачивания
+        "concurrent_fragments": 4,  # Параллельная загрузка фрагментов HLS/DASH
+        "http_chunk_size": 10485760,  # 10 МБ буфер для HTTP-запросов
+        "socket_timeout": 30,  # Увеличен таймаут для стабильности
     }
     if cookies_path:
         ydl_opts["cookiefile"] = cookies_path
+    if cookies_from_browser:
+        ydl_opts["cookiesfrombrowser"] = (cookies_from_browser,)
     # Субтитры: скачиваем и встраиваем, если выбран язык
     if subtitle_lang:
         ydl_opts.update({
@@ -395,6 +427,9 @@ def download_video(
             hls_opts["format"] = "bestaudio/best"
         else:
             hls_opts["format"] = format or "best"
+        # Дополнительные оптимизации для HLS
+        hls_opts.setdefault("concurrent_fragments", 6)  # Больше параллелизма для HLS
+        hls_opts.setdefault("http_chunk_size", 10485760)  # 10 МБ буфер
 
         _debug(
             f"download_video(HLS): is_hls=True format={hls_opts['format']} "
@@ -422,7 +457,10 @@ def download_video(
     # Шаг 1: извлечём info без скачивания (с фолбэком клиентов), чтобы подобрать реально доступный формат
     try:
         po_token = os.getenv("YT_PO_TOKEN")
-        info, used_client = extract_info_multi(url, cookies_path=cookies_path, po_token=po_token)
+        info, used_client = extract_info_multi(
+            url, cookies_path=cookies_path, po_token=po_token,
+            cookies_from_browser=cookies_from_browser,
+        )
         sample_ids = [str(f.get("format_id")) for f in (info.get("formats") or [])[:8]]
         _debug(
             f"download_video: probe_ok clients_used={used_client} "
@@ -459,33 +497,60 @@ def download_video(
         fmt_selector = "bv*+ba/b"
     _debug(f"download_video: format_selector={fmt_selector} desired_height={desired_height} audio_only={audio_only}")
 
-    # Шаг 2: непосредственно загрузка с подобранным форматом
-    try:
-        dl_opts = dict(ydl_opts)
-        dl_opts["format"] = fmt_selector
-        if "skip_download" in dl_opts:
+    # Шаг 2: непосредственно загрузка с подобранным форматом.
+    # Если текущий клиент даёт 403, пробуем другие клиенты (фоллбэк).
+    download_clients: list[str] = [used_client]
+    all_clients = ["web", "android_sdkless", "ios", "tv", "web_safari"]
+    for c in all_clients:
+        if c not in download_clients:
+            download_clients.append(c)
+
+    last_download_err: Exception | None = None
+    for dl_client in download_clients:
+        try:
+            dl_opts = dict(ydl_opts)
+            dl_opts["format"] = fmt_selector
             dl_opts.pop("skip_download", None)
-        # Используем тот же клиент, что и при анализе
-        dl_opts.setdefault("extractor_args", {}).setdefault("youtube", {})["player_client"] = [used_client]
-        if used_client == "android" and os.getenv("YT_PO_TOKEN"):
-            dl_opts["extractor_args"]["youtube"]["po_token"] = [os.getenv("YT_PO_TOKEN")]  # type: ignore[index]
-        with YoutubeDL(dl_opts) as ydl:
-            info2 = ydl.extract_info(url, download=True)
-            filepath = ydl.prepare_filename(info2)
-        _debug(f"download_video: downloaded filepath={filepath}")
+            # Клиент для этой попытки
+            dl_opts.setdefault("extractor_args", {}).setdefault("youtube", {})["player_client"] = [dl_client]
+            if dl_client == "android" and os.getenv("YT_PO_TOKEN"):
+                dl_opts["extractor_args"]["youtube"]["po_token"] = [os.getenv("YT_PO_TOKEN")]  # type: ignore[index]
 
-        if not filepath:
-            filepath = last_filename[0]
-        if not filepath:
-            raise RuntimeError("Не удалось определить путь загруженного файла")
-        return str(filepath)
+            _debug(f"download_video: trying client={dl_client} format={fmt_selector}")
+            with YoutubeDL(dl_opts) as ydl:
+                info2 = ydl.extract_info(url, download=True)
+                filepath = ydl.prepare_filename(info2)
+            _debug(f"download_video: downloaded filepath={filepath} client={dl_client}")
 
-    except DownloadCancelled as e:
-        _debug("download_video: cancelled by user")
-        raise
-    except DownloadError as e:
-        _debug(f"download_video: error {e}")
-        raise RuntimeError(f"Ошибка загрузки: {e}") from e
+            if not filepath:
+                filepath = last_filename[0]
+            if not filepath:
+                raise RuntimeError("Не удалось определить путь загруженного файла")
+            return str(filepath)
+
+        except DownloadCancelled:
+            _debug("download_video: cancelled by user")
+            raise
+        except (DownloadError, RuntimeError) as e:
+            err_str = str(e).lower()
+            # Если 403 или аналогичная ошибка доступа — пробуем следующий клиент
+            if "403" in err_str or "forbidden" in err_str:
+                _debug(f"download_video: client={dl_client} got 403, trying next")
+                last_download_err = e
+                continue
+            # Иные ошибки — не пробуем дальше
+            _debug(f"download_video: error {e}")
+            clean = _clean_yt_dlp_error_message(str(e))
+            raise RuntimeError(f"Ошибка загрузки: {clean}") from e
+
+    # Все клиенты дали 403
+    if last_download_err:
+        clean = _clean_yt_dlp_error_message(str(last_download_err))
+        raise RuntimeError(
+            f"Ошибка загрузки (все клиенты вернули 403): {clean}. "
+            "Попробуйте обновить yt-dlp (pip install -U yt-dlp) или использовать cookies."
+        ) from last_download_err
+    raise RuntimeError("Ошибка загрузки: неизвестная ошибка")
 
 
 def probe_video(
@@ -552,6 +617,7 @@ def probe_video(
 def analyze_video(
     url: str,
     cookies_path: str | None = None,
+    cookies_from_browser: str | None = None,
 ) -> tuple[dict, list[str], list[str]]:
     """
     Анализирует видео по URL без скачивания.
@@ -597,6 +663,8 @@ def analyze_video(
         }
         if cookies_path:
             ydl_opts["cookiefile"] = cookies_path
+        if cookies_from_browser:
+            ydl_opts["cookiesfrombrowser"] = (cookies_from_browser,)
         try:
             with YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)  # type: ignore[arg-type]
@@ -609,7 +677,8 @@ def analyze_video(
         try:
             po_token = os.getenv("YT_PO_TOKEN")
             info, used_client = extract_info_multi(
-                url, cookies_path=cookies_path, po_token=po_token
+                url, cookies_path=cookies_path, po_token=po_token,
+                cookies_from_browser=cookies_from_browser,
             )
             _debug(
                 f"analyze_video: extracted formats={len(info.get('formats', []))} "

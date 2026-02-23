@@ -35,8 +35,8 @@ COPY core/ ./core/
 COPY api/ ./api/
 COPY ui/ ./ui/
 COPY cli/ ./cli/
-COPY scripts/ ./scripts/
-COPY data/ ./data/
+COPY worker/ ./worker/
+COPY bot/ ./bot/
 
 # Объявим точки монтирования (необязательно, но удобно как подсказка)
 VOLUME ["/app/Downloads", "/data", "/app/tools"]

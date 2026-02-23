@@ -1,7 +1,7 @@
 # Основные зависимости для GrabVidZilla
 
 # Загрузка видео
-yt-dlp==2025.10.22
+yt-dlp>=2026.2.4
 
 # CLI интерфейс
 click==8.2.1
@@ -21,4 +21,16 @@ SQLAlchemy==2.0.44
 fastapi==0.121.1
 uvicorn[standard]==0.38.0
 pydantic==2.12.4
+
+# Браузерная автоматизация (динамический парсинг)
+playwright==1.49.0
+
+# Telegram-бот
+aiogram==3.25.0
+
+# HTTP-клиент (webhook, бот, уведомления)
+httpx>=0.27.0
+
+# Загрузка переменных из .env
+python-dotenv>=1.0.0
 

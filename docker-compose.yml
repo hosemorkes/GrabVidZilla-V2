@@ -7,6 +7,8 @@ services:
     tty: true
     working_dir: /app
     restart: unless-stopped
+    environment:
+      - GVZ_API_URL=http://grabvidzilla-api:8000
     volumes:
       - ./Downloads:/app/Downloads
       - ./tools:/app/tools
@@ -50,14 +52,71 @@ services:
     environment:
       - HOME=/app
       - DOWNLOADS_DIR=/app/Downloads
+      - DOWNLOAD_TTL_HOURS=48
+      - CLEANUP_INTERVAL_MIN=30
     ports:
       - "8000:8000"
     restart: unless-stopped
     volumes:
       - ./Downloads:/app/Downloads
       - ./tools:/app/tools
+      - ./data:/app/data
     networks:
       - grabvidzilla-net
+
+  grabvidzilla-worker:
+    image: grabvidzilla:latest
+    build: .
+    container_name: grabvidzilla-worker
+    working_dir: /app
+    entrypoint: ["python"]
+    command:
+      - -m
+      - worker.worker_main
+    environment:
+      - HOME=/app
+      - DOWNLOADS_DIR=/app/Downloads
+      - MAX_CONCURRENT_DOWNLOADS=2
+      - WORKER_POLL_INTERVAL_SEC=3
+      - WORKER_SHUTDOWN_TIMEOUT_SEC=30
+      - PROGRESS_UPDATE_INTERVAL_MS=1000
+      - DOWNLOAD_TTL_HOURS=48
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - GVZ_API_URL=http://grabvidzilla-api:8000
+      - GVZ_API_PUBLIC_URL=${GVZ_API_PUBLIC_URL}
+    restart: unless-stopped
+    volumes:
+      - ./Downloads:/app/Downloads
+      - ./tools:/app/tools
+      - ./data:/app/data
+    networks:
+      - grabvidzilla-net
+    depends_on:
+      - grabvidzilla-api
+
+  grabvidzilla-tel-bot:
+    image: grabvidzilla:latest
+    build: .
+    container_name: grabvidzilla-tel-bot
+    working_dir: /app
+    entrypoint: ["python"]
+    command:
+      - -m
+      - bot.bot_main
+    environment:
+      - HOME=/app
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS}
+      - GVZ_API_URL=http://grabvidzilla-api:8000
+      - GVZ_API_PUBLIC_URL=${GVZ_API_PUBLIC_URL}
+    restart: unless-stopped
+    volumes:
+      - ./Downloads:/app/Downloads
+      - ./data:/app/data
+    networks:
+      - grabvidzilla-net
+    depends_on:
+      - grabvidzilla-api
 
 networks:
   grabvidzilla-net:
