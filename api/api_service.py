@@ -210,6 +210,69 @@ class TaskManager:
         finally:
             session.close()
 
+    def create_convert_task(
+        self,
+        task_id: str,
+        telegram_chat_id: Optional[str] = None,
+    ) -> str:
+        """Создаёт задачу конвертации уже скачанного файла в MP4.
+
+        Находит завершённую задачу, проверяет наличие файла на диске
+        и создаёт новую задачу с флагом ``convert_to_mp4=True``.
+
+        Args:
+            task_id: ID завершённой (completed) задачи скачивания.
+            telegram_chat_id: chat_id пользователя Telegram (опционально).
+
+        Returns:
+            UUID новой задачи конвертации.
+
+        Raises:
+            TaskNotFound: если исходная задача не найдена.
+            InvalidTaskState: если задача не completed или файл уже в MP4.
+            FileMissing: если файл не найден на диске.
+        """
+        session = SessionLocal()
+        try:
+            dl = session.query(Download).filter(Download.id == task_id).first()
+            if not dl:
+                raise TaskNotFound(task_id)
+            if dl.status != "completed":
+                raise InvalidTaskState("source_task_not_completed")
+            if not dl.output_path or not os.path.isfile(dl.output_path):
+                raise FileMissing("source_file_missing")
+            ext = os.path.splitext(dl.output_path)[1].lower()
+            if ext == ".mp4":
+                raise InvalidTaskState("already_mp4")
+
+            # Сохраняем нужные данные перед закрытием сессии
+            source_path = dl.output_path
+            source_url = dl.url
+        finally:
+            session.close()
+
+        new_task_id = str(uuid4())
+        now = datetime.utcnow()
+
+        session = SessionLocal()
+        try:
+            new_dl = Download(
+                id=new_task_id,
+                url=source_url,         # URL исходного видео (для отображения)
+                status="queued",
+                progress=0.0,
+                convert_to_mp4=True,    # флаг: Worker вызовет convert_to_mp4() вместо download_video()
+                output_path=source_path,  # путь к исходному файлу; после конвертации Worker обновит
+                telegram_chat_id=telegram_chat_id,
+                created_at=now,
+            )
+            session.add(new_dl)
+            session.commit()
+        finally:
+            session.close()
+
+        return new_task_id
+
     def get_file_path(self, task_id: str) -> str:
         """Возвращает путь к скачанному файлу или бросает исключение."""
         session = SessionLocal()

@@ -92,6 +92,7 @@ class Download(Base):
     webhook_url: str | None = Column(String, nullable=True)        # URL для POST-уведомления при завершении
     webhook_sent: bool = Column(Boolean, default=False)            # флаг: webhook уже отправлен
     telegram_chat_id: str | None = Column(String, nullable=True)   # chat_id инициатора в Telegram
+    convert_to_mp4: bool = Column(Boolean, default=False)          # True — задача конвертации в MP4
 
     def to_dict(self) -> dict:
         """Сериализация записи в словарь для API-ответов."""
@@ -121,6 +122,7 @@ class Download(Base):
             "webhook_url": self.webhook_url,
             "webhook_sent": self.webhook_sent,
             "telegram_chat_id": self.telegram_chat_id,
+            "convert_to_mp4": self.convert_to_mp4,
         }
 
 
@@ -195,3 +197,10 @@ def _migrate_add_missing_columns() -> None:
                     sa_text(f"ALTER TABLE downloads ADD COLUMN {col_name} {col_def}")
                 )
                 conn.commit()
+
+        # Фаза 5: конвертация в MP4
+        if "convert_to_mp4" not in existing_columns:
+            conn.execute(
+                sa_text("ALTER TABLE downloads ADD COLUMN convert_to_mp4 BOOLEAN DEFAULT 0")
+            )
+            conn.commit()

@@ -783,6 +783,151 @@ def analyze_video(
     return info, qualities, subtitle_langs
 
 
+def convert_to_mp4(
+    input_path: str,
+    progress_callback: Callable[[float], None] | None = None,
+) -> str:
+    """Конвертирует видеофайл в MP4 (H.264 + AAC + faststart) через ffmpeg.
+
+    Исходный файл удаляется после успешной конвертации.
+
+    Args:
+        input_path: абсолютный путь к исходному файлу (например, .webm, .mkv).
+        progress_callback: колбек прогресса 0.0–100.0.
+
+    Returns:
+        Абсолютный путь к новому .mp4 файлу.
+
+    Raises:
+        FileNotFoundError: если исходный файл не найден.
+        ValueError: если файл уже в формате MP4.
+        RuntimeError: если ffmpeg не найден или конвертация завершилась с ошибкой.
+    """
+    import subprocess
+    import threading
+
+    input_path = os.path.abspath(input_path)
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(f"Файл для конвертации не найден: {input_path}")
+
+    base, ext = os.path.splitext(input_path)
+    if ext.lower() == ".mp4":
+        raise ValueError("Файл уже в формате MP4")
+
+    output_path = base + ".mp4"
+
+    # Получаем длительность через ffprobe для расчёта процента прогресса
+    duration_sec: float = 0.0
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet",
+                "-show_entries", "format=duration",
+                "-of", "csv=p=0",
+                input_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if probe.returncode == 0 and probe.stdout.strip():
+            duration_sec = float(probe.stdout.strip())
+    except Exception:
+        pass  # без длительности прогресс не покажем, но конвертацию продолжим
+
+    # Команда конвертации
+    # -progress pipe:1 — пишет прогресс построчно (key=value) в stdout
+    cmd = [
+        "ffmpeg",
+        "-i", input_path,
+        "-c:v", "libx264",       # видео: H.264
+        "-crf", "23",             # качество (18=высокое, 28=низкое, 23=по умолчанию)
+        "-preset", "fast",        # скорость кодирования: хороший баланс скорость/размер
+        "-c:a", "aac",            # аудио: AAC
+        "-b:a", "128k",           # битрейт аудио
+        "-movflags", "+faststart", # для стриминга: moov atom в начале файла
+        "-progress", "pipe:1",    # прогресс → stdout
+        "-stats_period", "2",     # частота обновлений прогресса (раз в 2 секунды)
+        "-y",                      # перезаписать без вопроса, если файл существует
+        output_path,
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            "ffmpeg не найден. Установите ffmpeg и добавьте его в PATH."
+        )
+
+    # Читаем stderr в фоновом потоке, чтобы не заблокировать буфер (64 КБ на Linux)
+    stderr_lines: list[str] = []
+
+    def _read_stderr() -> None:
+        if proc.stderr:
+            stderr_lines.extend(proc.stderr.readlines())
+
+    stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+    stderr_thread.start()
+
+    try:
+        # Читаем прогресс из stdout построчно
+        assert proc.stdout is not None
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            line = line.strip()
+            # ffmpeg пишет out_time_ms=<microseconds> (мкс, не мс — несмотря на название)
+            if line.startswith("out_time_ms=") and duration_sec > 0 and progress_callback:
+                try:
+                    val = int(line.split("=", 1)[1])
+                    if val > 0:
+                        pct = min(99.0, val / 1_000_000 / duration_sec * 100.0)
+                        progress_callback(pct)
+                except Exception:
+                    pass
+    except Exception:
+        proc.kill()
+        proc.wait()
+        raise
+
+    proc.wait()
+    stderr_thread.join(timeout=5)
+
+    if proc.returncode != 0:
+        # Берём последние строки stderr — там обычно самая полезная информация
+        stderr_text = "".join(stderr_lines[-20:])[:500]
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except Exception:
+                pass
+        raise RuntimeError(
+            f"ffmpeg завершился с ошибкой (код {proc.returncode}): {stderr_text}"
+        )
+
+    # Успешно — удаляем исходный файл
+    try:
+        os.remove(input_path)
+    except Exception:
+        _debug(f"convert_to_mp4: не удалось удалить исходный файл {input_path}")
+
+    # Итоговый прогресс 100%
+    if progress_callback:
+        try:
+            progress_callback(100.0)
+        except Exception:
+            pass
+
+    _debug(f"convert_to_mp4: завершено → {output_path}")
+    return output_path
+
+
 def select_format_for_height(
     info: dict,
     max_height: int | None,

@@ -503,9 +503,177 @@ async def cb_send_file(callback: CallbackQuery) -> None:
         )
 
 
+@router.callback_query(F.data.startswith("convert:"))
+async def cb_convert(callback: CallbackQuery) -> None:
+    """Запускает конвертацию уже скачанного файла в MP4.
+
+    Вызывает POST /downloads/{task_id}/convert через API,
+    затем отслеживает прогресс новой задачи конвертации.
+    """
+    await callback.answer("🔄 Запускаю конвертацию...")
+
+    task_id = (callback.data or "").split(":", 1)[1]
+    chat_id = str(callback.message.chat.id)
+
+    # Создаём задачу конвертации через API
+    try:
+        resp = await _get_http().post(
+            f"/downloads/{task_id}/convert",
+            params={"telegram_chat_id": chat_id},
+        )
+        resp.raise_for_status()
+        new_task_id = resp.json()["id"]
+    except httpx.HTTPStatusError as e:
+        detail = ""
+        try:
+            detail = e.response.json().get("detail", "")
+        except Exception:
+            pass
+        await callback.message.answer(
+            f"❌ Ошибка запуска конвертации: {detail or str(e)}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    except Exception as e:
+        await callback.message.answer(f"❌ Ошибка: {e}")
+        return
+
+    short = _short_id(new_task_id)
+    # Отправляем отдельное сообщение для отображения прогресса конвертации
+    status_msg = await callback.message.answer(
+        f"🔄 Конвертация добавлена в очередь. ID: <code>{short}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    # Отслеживаем прогресс — та же логика, что и при скачивании
+    await _track_task(status_msg, new_task_id, chat_id, progress_label="Конвертация")
+
+
 # ---------------------------------------------------------------------------
 # Скачивание + отслеживание прогресса
 # ---------------------------------------------------------------------------
+
+async def _track_task(
+    status_msg: Message,
+    task_id: str,
+    chat_id: str,
+    progress_label: str = "Скачивание",
+) -> None:
+    """Отслеживает прогресс задачи, редактируя status_msg.
+
+    Args:
+        status_msg: сообщение для редактирования (индикатор прогресса).
+        task_id: ID задачи в БД.
+        chat_id: ID чата для отправки файла.
+        progress_label: метка в строке прогресса («Скачивание» или «Конвертация»).
+    """
+    short = _short_id(task_id)
+    last_text = ""
+
+    while True:
+        await asyncio.sleep(3)
+
+        try:
+            resp = await _get_http().get(f"/downloads/{task_id}")
+            resp.raise_for_status()
+            task = resp.json()
+        except Exception:
+            continue
+
+        status = task["status"]
+
+        if status == "downloading":
+            progress = task.get("progress", 0)
+            speed = task.get("speed") or ""
+            eta = task.get("eta") or ""
+            text = f"⏬ {progress_label}: {progress:.0f}%"
+            if speed:
+                text += f" • {speed}"
+            if eta:
+                text += f" • осталось {eta}"
+            text += f"\nID: <code>{short}</code>"
+
+            if text != last_text:
+                try:
+                    await status_msg.edit_text(text, parse_mode=ParseMode.HTML)
+                    last_text = text
+                except Exception:
+                    pass  # message not modified
+
+        elif status == "completed":
+            filename = task.get("filename", "?")
+            file_size = task.get("file_size") or 0
+
+            text = (
+                f"✅ Готово!\n"
+                f"📄 {filename}\n"
+                f"📦 {_format_size(file_size)}"
+            )
+
+            # Кнопка «Конвертировать в MP4» — только если файл не MP4
+            ext = os.path.splitext(filename)[1].lower()
+            convert_kb = None
+            if ext and ext != ".mp4":
+                convert_kb = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="🔄 Конвертировать в MP4",
+                        callback_data=f"convert:{task_id}",
+                    )
+                ]])
+
+            bot = status_msg.bot
+            if file_size and file_size < TG_FILE_LIMIT:
+                # Файл ≤ лимита — отправляем как документ прямо в чат
+                try:
+                    await status_msg.edit_text(text + "\n\n📥 Отправляю файл...")
+                except Exception:
+                    pass
+
+                ok = await _send_file_to_chat(bot, chat_id, task_id)
+                if ok:
+                    try:
+                        await status_msg.edit_text(text, reply_markup=convert_kb)
+                    except Exception:
+                        pass
+                else:
+                    link = _download_link(task_id)
+                    try:
+                        await status_msg.edit_text(
+                            text + f"\n\n🔗 {link}",
+                            reply_markup=convert_kb,
+                        )
+                    except Exception:
+                        pass
+            else:
+                # Файл > лимита — текстовая ссылка
+                link = _download_link(task_id)
+                try:
+                    await status_msg.edit_text(
+                        text + f"\n\n🔗 {link}\n(файл > 500 MB — скачайте по ссылке)",
+                        reply_markup=convert_kb,
+                    )
+                except Exception:
+                    pass
+            break
+
+        elif status == "error":
+            err = task.get("error_message", "Неизвестная ошибка")
+            try:
+                await status_msg.edit_text(f"❌ Ошибка: {err}")
+            except Exception:
+                pass
+            break
+
+        elif status == "cancelled":
+            try:
+                await status_msg.edit_text("🚫 Задача отменена.")
+            except Exception:
+                pass
+            break
+
+        elif status == "queued":
+            pass  # ждём
+
 
 async def _start_and_track(
     event: Message | CallbackQuery,
@@ -541,99 +709,7 @@ async def _start_and_track(
     short = _short_id(task_id)
     await status_msg.edit_text(f"⏳ Добавлено в очередь. ID: <code>{short}</code>", parse_mode=ParseMode.HTML)
 
-    # Отслеживаем прогресс
-    last_text = ""
-    while True:
-        await asyncio.sleep(3)
-
-        try:
-            resp = await _get_http().get(f"/downloads/{task_id}")
-            resp.raise_for_status()
-            task = resp.json()
-        except Exception:
-            continue
-
-        status = task["status"]
-        if status == "downloading":
-            progress = task.get("progress", 0)
-            speed = task.get("speed") or ""
-            eta = task.get("eta") or ""
-            text = f"⏬ Скачивание: {progress:.0f}%"
-            if speed:
-                text += f" • {speed}"
-            if eta:
-                text += f" • осталось {eta}"
-            text += f"\nID: <code>{short}</code>"
-
-            if text != last_text:
-                try:
-                    await status_msg.edit_text(text, parse_mode=ParseMode.HTML)
-                    last_text = text
-                except Exception:
-                    pass  # message not modified
-
-        elif status == "completed":
-            filename = task.get("filename", "?")
-            file_size = task.get("file_size") or 0
-
-            text = (
-                f"✅ Готово!\n"
-                f"📄 {filename}\n"
-                f"📦 {_format_size(file_size)}"
-            )
-
-            if file_size and file_size < TG_FILE_LIMIT:
-                # Файл ≤ 50 MB — отправляем как документ прямо в чат
-                try:
-                    await status_msg.edit_text(text + "\n\n📥 Отправляю файл...")
-                except Exception:
-                    pass
-
-                bot = status_msg.bot
-                ok = await _send_file_to_chat(bot, chat_id, task_id)
-                if ok:
-                    try:
-                        await status_msg.edit_text(text)
-                    except Exception:
-                        pass
-                else:
-                    # Не удалось отправить — покажем текстовую ссылку
-                    link = _download_link(task_id)
-                    try:
-                        await status_msg.edit_text(
-                            text + f"\n\n🔗 {link}"
-                        )
-                    except Exception:
-                        pass
-            else:
-                # Файл > лимита — отправляем текстовую ссылку
-                link = _download_link(task_id)
-                try:
-                    await status_msg.edit_text(
-                        text + f"\n\n🔗 {link}"
-                        f"\n(файл > 500 MB — скачайте по ссылке)"
-                    )
-                except Exception:
-                    pass
-            break
-
-        elif status == "error":
-            err = task.get("error_message", "Неизвестная ошибка")
-            try:
-                await status_msg.edit_text(f"❌ Ошибка: {err}")
-            except Exception:
-                pass
-            break
-
-        elif status == "cancelled":
-            try:
-                await status_msg.edit_text("🚫 Задача отменена.")
-            except Exception:
-                pass
-            break
-
-        elif status == "queued":
-            pass  # ждём
+    await _track_task(status_msg, task_id, chat_id, progress_label="Скачивание")
 
 
 # ---------------------------------------------------------------------------

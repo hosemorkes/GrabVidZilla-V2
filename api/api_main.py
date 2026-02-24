@@ -432,3 +432,24 @@ async def get_downloaded_file(task_id: str):
     except TaskNotFound:
         raise HTTPException(status_code=404, detail="task_not_found")
 
+
+@app.post("/downloads/{task_id}/convert", response_model=StartDownloadResponse, status_code=201)
+async def convert_download(
+    task_id: str,
+    telegram_chat_id: Optional[str] = Query(None, description="chat_id Telegram для уведомлений"),
+) -> StartDownloadResponse:
+    """Создаёт задачу конвертации уже скачанного файла в MP4 (H.264 + AAC).
+
+    Worker заберёт задачу при следующем polling-цикле и вызовет ffmpeg.
+    Исходный файл удаляется после успешной конвертации.
+    """
+    try:
+        new_task_id = tm.create_convert_task(task_id, telegram_chat_id=telegram_chat_id)
+        return StartDownloadResponse(id=new_task_id)
+    except TaskNotFound:
+        raise HTTPException(status_code=404, detail="task_not_found")
+    except FileMissing:
+        raise HTTPException(status_code=404, detail="source_file_missing")
+    except InvalidTaskState as e:
+        raise HTTPException(status_code=409, detail=str(e))
+

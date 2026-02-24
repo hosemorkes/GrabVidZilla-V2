@@ -33,7 +33,7 @@ grabvidzilla/
 ├── .gitignore
 ├── core/                     # Бизнес-логика (ядро)
 │   ├── __init__.py
-│   ├── downloader.py         # download_video(), analyze_video() — чистые функции
+│   ├── downloader.py         # download_video(), analyze_video(), convert_to_mp4() — чистые функции
 │   ├── db.py                 # SQLite (data/app.db), Base, SessionLocal, init_db(), модель Download, WAL-режим
 │   ├── errors.py             # classify_download_error() — классификация ошибок скачивания
 │   ├── auth.py               # Модель User, регистрация/логин, роли (root/admin/user)
@@ -89,9 +89,9 @@ grabvidzilla/
 8. **Ошибки в `core/` не гасим — пробрасываем.** Обработка и форматирование — на уровне `cli`/`ui`.
 9. **Никаких циклических импортов.**
 10. **Разделение API и Worker:** API (FastAPI) только управляет задачами (CRUD по БД), Worker — только скачивает. Общение — исключительно через общую SQLite БД + общий Docker volume для файлов загрузок.
-11. **TaskManager (api/api_service.py)** — CRUD задач в БД: create_task, get_task, list_tasks, cancel_task, TTL-очистка. Не запускает скачивания.
-12. **Worker (worker/worker_main.py)** — polling БД каждые N секунд, атомарный захват `queued` задач (`_try_claim_task`), ограничение параллелизма (`MAX_CONCURRENT_DOWNLOADS`), прогресс пишет в БД, graceful shutdown. После завершения задачи отправляет webhook и/или Telegram-уведомление.
-13. **Bot (bot/bot_main.py)** — Telegram-бот на aiogram 3.x. Работает через HTTP API (не импортирует `core`). Файлы ≤ 500 MB отправляет через `send_document`, для больших — текстовая ссылка. Не использует `InlineKeyboardButton(url=...)` — Telegram отклоняет локальные URL.
+11. **TaskManager (api/api_service.py)** — CRUD задач в БД: create_task, get_task, list_tasks, cancel_task, create_convert_task, TTL-очистка. Не запускает скачивания.
+12. **Worker (worker/worker_main.py)** — polling БД каждые N секунд, атомарный захват `queued` задач (`_try_claim_task`), ограничение параллелизма (`MAX_CONCURRENT_DOWNLOADS`), прогресс пишет в БД, graceful shutdown. После завершения задачи отправляет webhook и/или Telegram-уведомление. Если `task.convert_to_mp4 == True` — вызывает `convert_to_mp4()` вместо `download_video()`.
+13. **Bot (bot/bot_main.py)** — Telegram-бот на aiogram 3.x. Работает через HTTP API (не импортирует `core`). Файлы ≤ 500 MB отправляет через `send_document`, для больших — текстовая ссылка. Не использует `InlineKeyboardButton(url=...)` — Telegram отклоняет локальные URL. После завершения задачи, если файл не `.mp4`, показывает inline-кнопку «Конвертировать в MP4».
 
 ---
 
@@ -106,6 +106,11 @@ download_video(url, output_path=".", progress_callback=None, progress_info_callb
 
 analyze_video(url, cookies_path=None) -> tuple[dict, list[str], list[str]]
 # Анализ ролика без скачивания: (info, qualities, subtitle_langs)
+
+convert_to_mp4(input_path: str, progress_callback=None) -> str
+# Конвертирует файл в MP4 (H.264 + AAC + faststart) через ffmpeg.
+# Исходный файл удаляется после успешной конвертации. Возвращает путь к новому .mp4.
+# Прогресс: парсит out_time_ms из ffmpeg -progress pipe:1.
 
 # core/parser.py
 find_media_urls(url, cookies_path=None, translation_hash=None)
@@ -146,6 +151,7 @@ register_adapter(adapter)
 - `GET /downloads/{id}` → состояние задачи
 - `DELETE /downloads/{id}` → отмена
 - `GET /downloads/{id}/file` → файл
+- `POST /downloads/{id}/convert` → `{id}` новой задачи конвертации (query: `telegram_chat_id?`); 404 если задача/файл не найдены, 409 если уже MP4 или задача не completed
 - `GET /media` → комбинированный поиск медиа-ссылок (параметры: `url`, `cookies_path?`, `use_browser?`, `fallback_to_browser?`, `translation_hash?`, `proxy_*?`)
 
 ENV (API): `DOWNLOADS_DIR`, `MAX_CONCURRENT_DOWNLOADS`, `QUEUE_STRATEGY`, `PERSIST_DOWNLOADS`, `CLEANUP_INTERVAL_MIN`, `DOWNLOAD_TTL_HOURS`, `GVZ_ALLOW_INSECURE_SSL`.
@@ -173,7 +179,8 @@ ENV (CLI/UI клиенты): `GVZ_API_URL` (по умолчанию `http://loca
 
 - `core/auth.py`: не логировать пароли/секреты; сообщения об ошибках — короткие и понятные; валидация (email, уникальность, роли) в `core`, форматирование — в `cli`/`ui`.
 - `core/db.py`: один `engine`, один `SessionLocal`, один `Base`; WAL-режим SQLite для безопасной работы из нескольких процессов (API + Worker); простая автомиграция для новых колонок через `ALTER TABLE`.
-  - Модель `Download` содержит поля: `webhook_url` (URL для webhook-уведомления), `webhook_sent` (флаг отправки), `telegram_chat_id` (ID чата Telegram для уведомлений).
+  - Модель `Download` содержит поля: `webhook_url` (URL для webhook-уведомления), `webhook_sent` (флаг отправки), `telegram_chat_id` (ID чата Telegram для уведомлений), `convert_to_mp4` (флаг: задача конвертации, Worker вызывает `convert_to_mp4()` вместо `download_video()`).
+  - Автомиграция через `_migrate_add_missing_columns()` добавляет новые колонки в существующую БД через `ALTER TABLE` (5 фаз, последняя — `convert_to_mp4`).
 
 ---
 

@@ -22,7 +22,12 @@ from typing import Any, Dict, Optional, Set
 import httpx
 
 from core.db import SessionLocal, Download, init_db
-from core.downloader import download_video, DownloadCancelled, compute_file_checksum
+from core.downloader import (
+    download_video,
+    DownloadCancelled,
+    compute_file_checksum,
+    convert_to_mp4 as convert_video_to_mp4,
+)
 from core.errors import classify_download_error
 
 # ---------------------------------------------------------------------------
@@ -123,6 +128,9 @@ class Worker:
                 task_audio_only = dl.audio_only
                 task_cookies = dl.cookies_path
                 task_subtitle = dl.subtitle_lang
+                # Флаги задачи конвертации
+                task_convert_to_mp4 = dl.convert_to_mp4
+                task_source_path = dl.output_path  # путь к исходному файлу (для конвертации)
             finally:
                 session.close()
 
@@ -208,21 +216,36 @@ class Worker:
                 finally:
                     s.close()
 
-            # Скачивание (блокирующая операция — запускаем в потоке)
+            # Выполнение задачи (блокирующая операция — запускаем в потоке)
             loop = asyncio.get_running_loop()
-            result_path: str = await loop.run_in_executor(
-                None,
-                lambda: download_video(
-                    url=task_url,
-                    output_path=DOWNLOADS_DIR,
-                    progress_callback=on_percent,
-                    progress_info_callback=on_info,
-                    format=task_format if not task_audio_only else None,
-                    audio_only=task_audio_only,
-                    cookies_path=task_cookies,
-                    subtitle_lang=task_subtitle,
-                ),
-            )
+
+            if task_convert_to_mp4:
+                # Задача конвертации: конвертируем уже скачанный файл в MP4
+                if not task_source_path or not os.path.isfile(task_source_path):
+                    raise RuntimeError(f"Исходный файл для конвертации не найден: {task_source_path}")
+
+                result_path: str = await loop.run_in_executor(
+                    None,
+                    lambda: convert_video_to_mp4(
+                        input_path=task_source_path,
+                        progress_callback=on_percent,
+                    ),
+                )
+            else:
+                # Обычная задача скачивания
+                result_path = await loop.run_in_executor(
+                    None,
+                    lambda: download_video(
+                        url=task_url,
+                        output_path=DOWNLOADS_DIR,
+                        progress_callback=on_percent,
+                        progress_info_callback=on_info,
+                        format=task_format if not task_audio_only else None,
+                        audio_only=task_audio_only,
+                        cookies_path=task_cookies,
+                        subtitle_lang=task_subtitle,
+                    ),
+                )
 
             # Контрольная сумма
             checksum: Optional[str] = None

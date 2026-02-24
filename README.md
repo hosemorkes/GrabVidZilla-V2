@@ -636,7 +636,8 @@ grabvidzilla/
     - `cancellation_requested: Boolean` — флаг запроса отмены (API ставит `True`, Worker проверяет в progress_callback);
     - `webhook_url: String | None` — URL для POST-уведомления при завершении задачи;
     - `webhook_sent: Boolean` — флаг успешной отправки webhook;
-    - `telegram_chat_id: String | None` — ID чата Telegram для уведомления через Bot API.
+    - `telegram_chat_id: String | None` — ID чата Telegram для уведомления через Bot API;
+    - `convert_to_mp4: Boolean` — если `True`, это задача конвертации: Worker вызовет `convert_to_mp4()` вместо `download_video()`, `output_path` указывает на исходный файл.
   - Схема статусов:
     ```
     queued → downloading → completed
@@ -716,6 +717,7 @@ python scripts/create_first_user.py
   - Общение между ними — исключительно через общую SQLite БД (`data/app.db`) + общий Docker volume для файлов загрузок (`Downloads/`).
   - SQLite работает в WAL-режиме для безопасного одновременного доступа из нескольких процессов.
   - `POST /downloads` → API создаёт запись `queued` в БД → Worker забирает при polling → обновляет прогресс в БД → API читает из БД.
+  - `POST /downloads/{id}/convert` → API создаёт задачу с `convert_to_mp4=True` и `output_path` → исходный файл → Worker вызывает `convert_to_mp4()` вместо `download_video()` → исходный файл удаляется после успеха.
   - Отмена: API ставит `cancellation_requested=True` в БД → Worker проверяет в progress_callback и прерывает.
   - При перезапуске Worker зависшие задачи (`downloading`) автоматически помечаются как `error(interrupted)`.
   - API можно перезапустить без потери активных скачиваний (Worker продолжает работать).
@@ -922,6 +924,13 @@ Worker автоматически начнёт забирать задачи и�
   - Возвращает скачанный файл (Content-Disposition с именем).
   - Ошибки: `409 file_not_ready`, `404 task_not_found`, `500 file_missing`.
 
+- POST `/downloads/{task_id}/convert`
+  - Создаёт задачу конвертации уже скачанного файла в MP4 (H.264 + AAC + faststart).
+  - Worker заберёт задачу при следующем polling-цикле и вызовет ffmpeg. Исходный файл удаляется.
+  - Query-параметры: `telegram_chat_id` (опционально, для уведомления).
+  - Ответ: `201 Created` → `{"id": "NEW_TASK_UUID"}`
+  - Ошибки: `404 task_not_found` / `404 source_file_missing`, `409 source_task_not_completed` / `409 already_mp4`.
+
 - GET `/media`
   - Выполняет поиск медиа-ссылок (статический парсер + опциональный Playwright fallback).
   - Параметры: `url` (обязательный), `cookies_path?`, `use_browser?`, `fallback_to_browser?`, `translation_hash?`, `proxy_server?`, `proxy_username?`, `proxy_password?`.
@@ -963,6 +972,12 @@ curl -OJ http://localhost:8000/downloads/TASK_UUID/file
 
 # Отменить задачу
 curl -X DELETE http://localhost:8000/downloads/TASK_UUID
+
+# Конвертировать скачанный файл в MP4
+curl -X POST "http://localhost:8000/downloads/TASK_UUID/convert"
+
+# То же, но с уведомлением в Telegram
+curl -X POST "http://localhost:8000/downloads/TASK_UUID/convert?telegram_chat_id=123456789"
 ```
 
 ### Переменные окружения
@@ -1046,6 +1061,7 @@ python -m bot.bot_main
 - По завершении:
   - Файлы ≤ 500 MB — автоматически отправляются как документ (`send_document`) прямо в чат
   - Файлы > 500 MB — текстовая ссылка для скачивания через браузер
+  - Если файл не `.mp4` (например, `.webm`) — появляется inline-кнопка **«Конвертировать в MP4»**: бот запускает конвертацию через Worker и отслеживает прогресс
 - Команды: `/queue`, `/history`, `/cancel <id>`, `/help`
 - `/history` — кнопки «Скачать» для файлов ≤ 500 MB, текстовые ссылки для больших
 - Whitelist: только пользователи из `TELEGRAM_ALLOWED_USERS` могут использовать бота
