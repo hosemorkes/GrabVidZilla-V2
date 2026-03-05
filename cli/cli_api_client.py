@@ -11,14 +11,17 @@ import os
 import re
 import sys
 import time
-from typing import Optional, Tuple, Dict, List
+import threading
+from typing import Optional, Tuple, Dict, List, Callable
 from urllib.parse import urlparse
 from collections import OrderedDict
 
 import click
 import requests
 from rich.console import Console
+from rich.live import Live
 from rich.progress import Progress, BarColumn, TextColumn, SpinnerColumn
+from rich.table import Table
 
 # URL API по умолчанию
 API_BASE_URL = os.getenv("GVZ_API_URL", "http://localhost:8000")
@@ -115,6 +118,40 @@ def _format_duration(seconds: Optional[float]) -> str:
     return f"{seconds:.1f} сек"
 
 
+def _track_single_task(
+    task_id: str,
+    session: requests.Session,
+    api_url: str = API_BASE_URL,
+    on_update: Optional[Callable[[dict], None]] = None,
+    poll_interval: float = 0.5,
+) -> dict:
+    """
+    Опрашивает API до завершения одной задачи (статус: completed, error, cancelled).
+
+    Параметры:
+        task_id: идентификатор задачи.
+        session: HTTP-сессия для запросов.
+        api_url: базовый URL API.
+        on_update: колбек, вызывается с dict задачи при каждом успешном опросе.
+        poll_interval: интервал между опросами в секундах.
+
+    Возвращает финальный словарь состояния задачи.
+    """
+    terminal_states = {"completed", "error", "cancelled"}
+    while True:
+        try:
+            resp = session.get(f"{api_url}/downloads/{task_id}", timeout=5)
+            resp.raise_for_status()
+            task = resp.json()
+            if on_update:
+                on_update(task)
+            if task.get("status") in terminal_states:
+                return task
+        except requests.exceptions.RequestException:
+            pass  # временные сбои сети — продолжаем опрос
+        time.sleep(poll_interval)
+
+
 def _run_download_via_api(
     url: str,
     cookies_path: Optional[str] = None,
@@ -145,13 +182,13 @@ def _run_download_via_api(
 
         response = requests.post(f"{API_BASE_URL}/downloads", json=payload, timeout=10)
         response.raise_for_status()
-        task_data = response.json()
-        task_id = task_data["id"]
+        task_id = response.json()["id"]
 
         console.print(":rocket: [bold]Старт загрузки[/bold]", style="cyan")
         started_at = time.perf_counter()
+        session = requests.Session()
 
-        # Отслеживаем прогресс
+        # Показываем прогресс-бар и опрашиваем задачу через _track_single_task
         with Progress(
             SpinnerColumn(),
             BarColumn(bar_width=40),
@@ -160,74 +197,56 @@ def _run_download_via_api(
             TextColumn("{task.fields[speed]}"),
             console=console,
             transient=True,
-            refresh_per_second=4,  # Обновляем 4 раза в секунду для плавности
+            refresh_per_second=4,
         ) as progress:
-            task_id_progress = progress.add_task(
+            progress_task = progress.add_task(
                 "[cyan]Загрузка...[/cyan]",
                 total=100,
-                speed="—"
+                speed="—",
             )
 
-            last_progress = 0.0
-            while True:
-                try:
-                    status_response = requests.get(f"{API_BASE_URL}/downloads/{task_id}", timeout=5)
-                    status_response.raise_for_status()
-                    task_status = status_response.json()
+            def on_update(task_status: dict) -> None:
+                """Обновляем прогресс-бар при каждом опросе API."""
+                pct = task_status.get("progress", 0.0) or 0.0
+                speed = task_status.get("speed") or "—"
+                progress.update(progress_task, completed=pct, speed=speed)
 
-                    state = task_status.get("status", "unknown")
-                    progress_pct = task_status.get("progress", 0.0)
-                    speed_str_raw = task_status.get("speed")
-                    filename = task_status.get("filename")
-                    error_message = task_status.get("error_message")
-                    error_type = task_status.get("error_type")
-                    file_size = task_status.get("file_size")
+            # Блокирующий опрос до завершения задачи (0.5 сек между запросами)
+            final = _track_single_task(
+                task_id, session, api_url=API_BASE_URL,
+                on_update=on_update, poll_interval=0.5,
+            )
 
-                    # Обновляем прогресс при каждом опросе для плавного отображения
-                    speed_display = speed_str_raw or "—"
-                    progress.update(
-                        task_id_progress,
-                        completed=progress_pct,
-                        description="[cyan]Загрузка...[/cyan]",
-                        speed=speed_display,
-                    )
-                    last_progress = progress_pct
+        state = final.get("status", "unknown")
+        filename = final.get("filename")
+        elapsed = time.perf_counter() - started_at
 
-                    if state == "completed":
-                        progress.update(task_id_progress, completed=100, speed=speed_display)
-                        elapsed = time.perf_counter() - started_at
-                        console.print()  # Новая строка после прогресс-бара
-                        console.print(f":white_check_mark: [bold green]Готово[/bold green]: {filename}")
-                        console.print(f"[dim]Время скачивания: {_format_duration(elapsed)}[/dim]")
+        if state == "completed":
+            console.print()
+            console.print(f":white_check_mark: [bold green]Готово[/bold green]: {filename}")
+            console.print(f"[dim]Время скачивания: {_format_duration(elapsed)}[/dim]")
+            file_size = final.get("file_size")
+            if file_size:
+                console.print(f"[dim]Размер файла: {_format_size(file_size)}[/dim]")
+            checksum_hex = final.get("sha256")
+            if checksum_hex:
+                console.print(f"[dim]SHA-256: {checksum_hex}[/dim]")
+            console.print()
+            return True, filename, checksum_hex
 
-                        # Размер файла
-                        if file_size:
-                            console.print(f"[dim]Размер файла: {_format_size(file_size)}[/dim]")
-                        checksum_hex = task_status.get("sha256")
-                        if checksum_hex:
-                            console.print(f"[dim]SHA-256: {checksum_hex}[/dim]")
-                        console.print()  # отступ после успешного завершения
-                        return True, filename, checksum_hex
+        elif state == "error":
+            console.print()
+            err_text = final.get("error_message") or "Неизвестная ошибка"
+            error_type = final.get("error_type")
+            if error_type:
+                err_text = f"[{error_type}] {err_text}"
+            console.print(f":boom: [bold red]Ошибка[/bold red]: {err_text}")
+            return False, None, None
 
-                    elif state == "error":
-                        console.print()  # Новая строка после прогресс-бара
-                        err_text = error_message or "Неизвестная ошибка"
-                        if error_type:
-                            err_text = f"[{error_type}] {err_text}"
-                        console.print(f":boom: [bold red]Ошибка[/bold red]: {err_text}")
-                        return False, None, None
-
-                    elif state == "cancelled":
-                        console.print()  # Новая строка после прогресс-бара
-                        console.print("[yellow]Загрузка отменена[/yellow]")
-                        return False, None, None
-
-                    # Ждём перед следующим опросом (опрашиваем чаще для плавного обновления)
-                    time.sleep(0.5)
-
-                except requests.exceptions.RequestException as e:
-                    console.print(f"[red]Ошибка получения статуса: {e}[/red]")
-                    return False, None, None
+        else:  # cancelled или unknown
+            console.print()
+            console.print("[yellow]Загрузка отменена[/yellow]")
+            return False, None, None
 
     except requests.exceptions.RequestException as e:
         error_msg = str(e)
@@ -244,6 +263,207 @@ def _run_download_via_api(
         return False, None, None
 
 
+def _extract_site(url: str) -> str:
+    """Извлекает короткое имя сайта из URL (например, 'youtube', 'vk', 'tiktok')."""
+    try:
+        host = urlparse(url).netloc
+        host = host.lstrip("www.")
+        return host.split(".")[0]
+    except Exception:
+        return url[:12]
+
+
+def _run_batch_download(
+    urls: List[str],
+    cookies_path: Optional[str] = None,
+    fmt: Optional[str] = None,
+    audio_only: bool = False,
+    subtitle_lang: Optional[str] = None,
+) -> None:
+    """
+    Batch-скачивание: отправляет все задачи и параллельно отслеживает их в живой таблице.
+
+    Каждая задача отслеживается в отдельном потоке через _track_single_task.
+    Живая таблица (rich.Live) обновляется каждые 0.5 сек до завершения всех задач.
+
+    Параметры:
+        urls: список URL для скачивания.
+        cookies_path: путь к файлу cookies.
+        fmt: строка формата yt-dlp.
+        audio_only: если True — скачивать только аудио.
+        subtitle_lang: код языка субтитров.
+    """
+    console.print(f"\n[bold]:clipboard: Batch download: {len(urls)} URLs[/bold]")
+    console.print("─" * 50)
+
+    session = requests.Session()
+
+    # Шаг 1: отправляем все задачи и собираем task_id
+    tasks: List[Dict] = []
+    for i, url in enumerate(urls, 1):
+        short_url = url[:57] + "..." if len(url) > 60 else url
+        console.print(f"[{i}/{len(urls)}] Submitting: {short_url} ", end="")
+
+        payload: Dict = {
+            "url": url,
+            "format": fmt if not audio_only else None,
+            "audio_only": audio_only,
+        }
+        if cookies_path:
+            payload["cookies_path"] = cookies_path
+        if subtitle_lang:
+            payload["subtitle_lang"] = subtitle_lang
+
+        try:
+            resp = session.post(f"{API_BASE_URL}/downloads", json=payload, timeout=10)
+            resp.raise_for_status()
+            task_id = resp.json()["id"]
+            console.print(f"[green]:white_check_mark: {task_id[:8]}[/green]")
+            tasks.append({
+                "url": url, "task_id": task_id,
+                "status": "queued", "progress": 0.0,
+                "filename": None, "error": None, "speed": "",
+            })
+        except requests.exceptions.RequestException as e:
+            err_msg = str(e)
+            if hasattr(e, "response") and e.response is not None:
+                try:
+                    err_msg = e.response.json().get("detail", err_msg)
+                except Exception:
+                    pass
+            console.print(f"[red]:x: Ошибка: {err_msg}[/red]")
+            tasks.append({
+                "url": url, "task_id": None,
+                "status": "error", "progress": 0.0,
+                "filename": None, "error": err_msg, "speed": "",
+            })
+
+    submitted = [t for t in tasks if t["task_id"] is not None]
+    if not submitted:
+        console.print("[red]Ни одна задача не была создана.[/red]")
+        return
+
+    console.print()
+
+    # Шаг 2: параллельный трекинг — каждая задача в отдельном потоке через _track_single_task
+    terminal_states = {"completed", "error", "cancelled"}
+
+    def _track_task_thread(t: dict) -> None:
+        """Отслеживает одну задачу в потоке, обновляя общий dict состояния."""
+        def on_update(data: dict) -> None:
+            t["status"] = data.get("status", "unknown")
+            t["progress"] = data.get("progress") or 0.0
+            t["filename"] = data.get("filename")
+            # Скорость показываем только во время скачивания
+            t["speed"] = data.get("speed") or "" if t["status"] == "downloading" else ""
+            if t["status"] == "error":
+                t["error"] = data.get("error_message", "Неизвестная ошибка")
+
+        _track_single_task(t["task_id"], session, on_update=on_update, poll_interval=2.0)
+
+    threads = [
+        threading.Thread(target=_track_task_thread, args=(t,), daemon=True)
+        for t in submitted
+    ]
+    for th in threads:
+        th.start()
+
+    def _make_table() -> Table:
+        """Строит таблицу текущего состояния всех задач."""
+        in_prog = sum(
+            1 for t in tasks if t["task_id"] and t["status"] not in terminal_states
+        )
+        done = sum(1 for t in tasks if t["status"] == "completed")
+        queued = sum(1 for t in tasks if t["status"] == "queued")
+        failed = sum(1 for t in tasks if t["status"] == "error")
+
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("#", style="dim", width=10, no_wrap=True)
+        table.add_column("Сайт", width=12, no_wrap=True)
+        table.add_column("Статус", width=14, no_wrap=True)
+        table.add_column("Прогресс", width=14, no_wrap=True)
+        table.add_column("Скорость", width=12, no_wrap=True)
+        table.add_column("Файл", width=22, no_wrap=True)
+
+        for t in tasks:
+            task_id_short = (t["task_id"] or "")[:8] or "—"
+            site_str = _extract_site(t["url"])
+
+            status = t["status"]
+            if status == "completed":
+                status_str = "[green]completed[/green]"
+            elif status == "error":
+                status_str = "[red]error[/red]"
+            elif status == "cancelled":
+                status_str = "[yellow]cancelled[/yellow]"
+            elif status == "downloading":
+                status_str = "[cyan]downloading[/cyan]"
+            else:
+                status_str = f"[dim]{status}[/dim]"
+
+            pct = t.get("progress") or 0.0
+            if t["task_id"] is None:
+                progress_str = "[red]—[/red]"
+            elif status == "completed":
+                progress_str = "████ 100%"
+            elif status in ("error", "cancelled"):
+                progress_str = "—"
+            else:
+                filled = min(4, int(pct / 25))
+                progress_str = "█" * filled + "░" * (4 - filled) + f" {pct:.0f}%"
+
+            # Скорость — только во время активного скачивания
+            speed_str = t.get("speed") or "" if status == "downloading" else ""
+
+            filename = t.get("filename") or ""
+            filename_short = ("…" + filename[-19:]) if len(filename) > 22 else filename
+
+            table.add_row(
+                task_id_short, site_str, status_str,
+                progress_str, speed_str, filename_short,
+            )
+
+        return table
+
+    # Живая таблица обновляется, пока хотя бы один поток активен
+    with Live(_make_table(), console=console, refresh_per_second=2) as live:
+        while any(th.is_alive() for th in threads):
+            live.update(_make_table())
+            time.sleep(0.5)
+        live.update(_make_table())
+
+    for th in threads:
+        th.join()
+
+    # Итоговая строка статистики — обычный print без разметки bold/big
+    _in_prog = sum(1 for t in tasks if t["task_id"] and t["status"] not in terminal_states)
+    _done = sum(1 for t in tasks if t["status"] == "completed")
+    _queued = sum(1 for t in tasks if t["status"] == "queued")
+    _failed = sum(1 for t in tasks if t["status"] == "error")
+    console.print(
+        f"⏳ In progress: {_in_prog}  "
+        f"✅ Done: {_done}  "
+        f"⏸ Queued: {_queued}  "
+        f"❌ Failed: {_failed}"
+    )
+
+    # Шаг 3: итоговый отчёт
+    done_count = sum(1 for t in tasks if t["status"] == "completed")
+    failed_count = sum(1 for t in tasks if t["status"] == "error")
+    cancelled_count = sum(1 for t in tasks if t["status"] == "cancelled")
+    downloads_dir = os.getenv("DOWNLOADS_DIR", "Downloads")
+
+    console.print()
+    console.print("[bold]" + "\u2501" * 40 + "[/bold]")
+    console.print(":bar_chart: [bold]Результат batch-скачивания:[/bold]")
+    console.print(f":white_check_mark: Успешно:  {done_count}")
+    console.print(f":x: Ошибок:   {failed_count}")
+    if cancelled_count:
+        console.print(f":no_entry: Отменено: {cancelled_count}")
+    console.print(f":open_file_folder: Файлы сохранены в: {downloads_dir}")
+    console.print("[bold]" + "\u2501" * 40 + "[/bold]")
+
+
 def _show_menu_and_handle(
     use_browser_parser: bool,
     browser_proxy_url: Optional[str],
@@ -255,7 +475,7 @@ def _show_menu_and_handle(
         console.print()  # отступ перед показом меню
         console.print("[bold]GrabVidZilla API Client[/bold] — кроссплатформенный загрузчик видео")
         console.print(f"[dim]API: {API_BASE_URL}[/dim]")
-        console.print("1. Скачать видео")
+        console.print("1. Скачать видео (один URL, несколько или файл со списком)")
         console.print("2. help")
         console.print("3. Загрузить cookies")
         console.print("4. Найти видео на странице")
@@ -264,13 +484,55 @@ def _show_menu_and_handle(
         choice = click.prompt("Выберите пункт", type=int, default=1)
 
         if choice == 1:
-            url = click.prompt("Введите URL видео", type=str)
-            try:
-                # Если есть cookies в tools/cookies.txt — используем их
-                project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-                default_cookies = os.path.join(project_root, "tools", "cookies.txt")
-                use_cookies = default_cookies if os.path.isfile(default_cookies) else None
+            # Подсказка: принимаем один URL, несколько через пробел или файл со списком
+            console.print()
+            console.print("[bold]Введите URL для скачивания.[/bold]")
+            console.print(
+                "[dim]Можно: одну ссылку / несколько через пробел"
+                " / путь к файлу со списком URL[/dim]"
+            )
+            raw = click.prompt("URL(ы) или файл", type=str).strip()
 
+            if not raw:
+                console.print("[yellow]URL не введён.[/yellow]")
+                console.print()
+                continue
+
+            # Разбираем ввод: если это файл — читаем из него, иначе делим по пробелам
+            if os.path.isfile(raw):
+                with open(raw, "r", encoding="utf-8") as f:
+                    input_urls = [
+                        ln.strip() for ln in f
+                        if ln.strip() and not ln.strip().startswith("#")
+                    ]
+            else:
+                input_urls = raw.split()
+
+            if not input_urls:
+                console.print("[red]:x: Не найдено ни одного URL.[/red]")
+                console.print()
+                continue
+
+            # Cookies по умолчанию из tools/cookies.txt
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            default_cookies = os.path.join(project_root, "tools", "cookies.txt")
+            use_cookies = default_cookies if os.path.isfile(default_cookies) else None
+
+            if len(input_urls) > 1:
+                # Batch-режим: несколько URL — параллельный трекинг через _run_batch_download
+                console.print(
+                    f"[dim]Найдено {len(input_urls)} URL — запускаем batch-режим.[/dim]"
+                )
+                try:
+                    _run_batch_download(urls=input_urls, cookies_path=use_cookies)
+                except Exception as exc:
+                    console.print(f":boom: [bold red]Ошибка[/bold red]: {exc}")
+                console.print()
+                continue
+
+            # Одиночный режим — анализ, выбор качества, скачивание
+            url = input_urls[0]
+            try:
                 # Анализируем через API
                 try:
                     params = {"url": url}
@@ -373,6 +635,26 @@ def _show_menu_and_handle(
             console.print()
             console.print("Переменные окружения:")
             console.print(f"  GVZ_API_URL — URL API сервера (по умолчанию: {API_BASE_URL})")
+            console.print()
+            console.print(":inbox_tray: [bold]Скачивание нескольких видео (batch-режим):[/bold]")
+            console.print("─" * 50)
+            console.print("Пункт 1 принимает три формата ввода:")
+            console.print()
+            console.print("  [cyan]• Одна ссылка:[/cyan]")
+            console.print("      https://youtube.com/watch?v=xxx")
+            console.print()
+            console.print("  [cyan]• Несколько ссылок через пробел:[/cyan]")
+            console.print("      https://youtube.com/... https://vk.com/...")
+            console.print()
+            console.print("  [cyan]• Путь к текстовому файлу (один URL на строку):[/cyan]")
+            console.print("      /home/user/urls.txt   или   urls.txt")
+            console.print()
+            console.print("[dim]Формат файла urls.txt:[/dim]")
+            console.print("[dim]  # это комментарий — строка игнорируется[/dim]")
+            console.print("[dim]  https://youtube.com/watch?v=aaa[/dim]")
+            console.print("[dim]  https://tiktok.com/@user/video/bbb[/dim]")
+            console.print()
+            console.print("[dim]Прогресс batch — живая таблица, итог по завершении всех задач.[/dim]")
             console.print()
             console.print("[cyan]0. Вернуться в меню[/cyan]")
             _ = click.prompt("Нажмите 0 для возврата", type=int, default=0)
@@ -1093,12 +1375,16 @@ def _show_menu_and_handle(
             console.print()
 
 
-@click.command(
+@click.group(
     name="grabvidzilla-api",
+    invoke_without_command=True,
     help=(
         "\nCLI-клиент GrabVidZilla, работающий через HTTP API.\n\n"
         "Использование:\n"
-        "  grabvidzilla-api                 # открыть меню\n\n"
+        "  grabvidzilla-api                        # открыть интерактивное меню\n"
+        "  grabvidzilla-api download URL           # скачать одно видео\n"
+        "  grabvidzilla-api download URL1 URL2     # batch-скачивание\n"
+        "  grabvidzilla-api download --batch file  # batch из файла\n\n"
         "Переменные окружения:\n"
         "  GVZ_API_URL — URL API сервера (по умолчанию: http://localhost:8000)\n\n"
         "Примеры:\n"
@@ -1119,24 +1405,139 @@ def _show_menu_and_handle(
     default=None,
     help="Прокси для браузерного парсера (пример: http://user:pass@host:3128).",
 )
-def main(use_browser_parser: bool, browser_proxy_url: Optional[str]) -> None:
+@click.pass_context
+def main(ctx: click.Context, use_browser_parser: bool, browser_proxy_url: Optional[str]) -> None:
     """
-    Точка входа CLI API-клиента. Показывает интерактивное меню.
+    Точка входа CLI API-клиента. Без подкоманды — открывает интерактивное меню.
     """
-    # Проверяем доступность API
-    try:
-        response = requests.get(f"{API_BASE_URL}/health", timeout=5)
-        response.raise_for_status()
-    except requests.exceptions.RequestException:
-        console.print(f"[red]Ошибка: не удалось подключиться к API по адресу {API_BASE_URL}[/red]")
-        console.print("[yellow]Убедитесь, что API сервер запущен.[/yellow]")
-        console.print()
-        if click.confirm("Продолжить всё равно?", default=False):
-            pass
-        else:
-            sys.exit(1)
+    # Проверяем доступность API перед любой командой, кроме --help
+    if "--help" not in sys.argv and "-h" not in sys.argv:
+        try:
+            response = requests.get(f"{API_BASE_URL}/health", timeout=5)
+            response.raise_for_status()
+        except requests.exceptions.RequestException:
+            console.print(
+                f"[red]Ошибка: не удалось подключиться к API по адресу {API_BASE_URL}[/red]"
+            )
+            console.print("[yellow]Убедитесь, что API сервер запущен.[/yellow]")
+            console.print()
+            if click.confirm("Продолжить всё равно?", default=False):
+                pass
+            else:
+                sys.exit(1)
 
-    _show_menu_and_handle(use_browser_parser=use_browser_parser, browser_proxy_url=browser_proxy_url)
+    # Если подкоманда не указана — показываем интерактивное меню (старое поведение)
+    if ctx.invoked_subcommand is None:
+        _show_menu_and_handle(use_browser_parser=use_browser_parser, browser_proxy_url=browser_proxy_url)
+
+
+@main.command(
+    name="download",
+    help=(
+        "Скачать одно или несколько видео через API.\n\n"
+        "Примеры:\n"
+        "  grabvidzilla-api download https://youtube.com/...\n"
+        "  grabvidzilla-api download URL1 URL2 URL3\n"
+        "  grabvidzilla-api download --batch urls.txt\n"
+        "  grabvidzilla-api download URL --quality 720p\n"
+        "  grabvidzilla-api download URL --audio-only\n"
+    ),
+)
+@click.argument("urls", nargs=-1, required=False)
+@click.option(
+    "--batch", "-b",
+    "batch_file",
+    type=click.Path(exists=True),
+    default=None,
+    help="Текстовый файл со списком URL (по одному на строку, # — комментарий).",
+)
+@click.option(
+    "--quality", "-q",
+    "quality",
+    default=None,
+    help="Качество: 720p, 1080p, best и т.д. (по умолчанию: best).",
+)
+@click.option(
+    "--audio-only", "-a",
+    "audio_only",
+    is_flag=True,
+    default=False,
+    help="Скачивать только аудио.",
+)
+@click.option(
+    "--cookies", "-c",
+    "cookies_path",
+    type=click.Path(),
+    default=None,
+    help="Путь к файлу cookies.txt (Netscape формат).",
+)
+@click.option(
+    "--subtitle-lang", "-s",
+    "subtitle_lang",
+    default=None,
+    help="Код языка субтитров (например: ru, en).",
+)
+def download_cmd(
+    urls: tuple,
+    batch_file: Optional[str],
+    quality: Optional[str],
+    audio_only: bool,
+    cookies_path: Optional[str],
+    subtitle_lang: Optional[str],
+) -> None:
+    """
+    Скачивает одно или несколько видео через REST API.
+
+    При одном URL — одиночный режим с прогресс-баром.
+    При нескольких URL или --batch — batch-режим с живой таблицей прогресса.
+    Все опции (--quality, --audio-only и т.д.) применяются ко всем URL.
+    """
+    # Собираем URL из аргументов командной строки и файла --batch
+    all_urls = list(urls)
+    if batch_file:
+        with open(batch_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    all_urls.append(line)
+
+    if not all_urls:
+        console.print("[red]:x: Укажите хотя бы один URL или файл --batch[/red]")
+        raise SystemExit(1)
+
+    # Определяем формат на основе указанного качества
+    if audio_only:
+        fmt = None  # _run_download_via_api сам передаёт audio_only=True в API
+    elif quality:
+        fmt = _build_format_selector(quality)
+    else:
+        fmt = None  # API выберет лучшее качество автоматически
+
+    # Если cookies не указаны явно — пробуем tools/cookies.txt
+    if not cookies_path:
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        default_cookies = os.path.join(project_root, "tools", "cookies.txt")
+        if os.path.isfile(default_cookies):
+            cookies_path = default_cookies
+
+    if len(all_urls) == 1:
+        # Одиночный режим — стандартный прогресс-бар, поведение как раньше
+        _run_download_via_api(
+            url=all_urls[0],
+            cookies_path=cookies_path,
+            fmt=fmt,
+            audio_only=audio_only,
+            subtitle_lang=subtitle_lang,
+        )
+    else:
+        # Batch-режим — живая таблица с параллельным трекингом всех задач
+        _run_batch_download(
+            urls=all_urls,
+            cookies_path=cookies_path,
+            fmt=fmt,
+            audio_only=audio_only,
+            subtitle_lang=subtitle_lang,
+        )
 
 
 if __name__ == "__main__":

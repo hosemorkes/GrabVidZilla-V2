@@ -224,6 +224,155 @@ def _is_bot_detection_error(error_text: str) -> bool:
     return "sign in to confirm" in lower or "not a bot" in lower
 
 
+def _extract_site(url: str) -> str:
+    """Извлекает короткое имя сайта из URL (например, 'youtube', 'vk', 'tiktok')."""
+    try:
+        host = urlparse(url).netloc
+        host = host.lstrip("www.")
+        return host.split(".")[0]
+    except Exception:
+        return url[:12]
+
+
+def _run_batch_download_local(
+    urls: List[str],
+    output_path: str,
+    cookies_path: Optional[str] = None,
+) -> None:
+    """
+    Batch-скачивание через core напрямую (без Worker).
+
+    Задачи выполняются последовательно, прогресс всех URL отображается
+    в живой таблице (rich.Live). Скорость берётся из progress_info_callback.
+
+    Параметры:
+        urls: список URL для скачивания.
+        output_path: путь к папке сохранения.
+        cookies_path: путь к cookies.txt.
+    """
+    import os
+    import time
+    from rich.live import Live
+    from rich.table import Table
+
+    terminal_states = {"completed", "error"}
+
+    tasks: List[Dict] = [
+        {
+            "url": url, "status": "queued", "progress": 0.0,
+            "speed": "", "filename": None, "error": None,
+        }
+        for url in urls
+    ]
+
+    def _fmt_speed(bps: Optional[float]) -> str:
+        """Форматирует скорость в байтах/сек в читаемую строку."""
+        if not bps or bps <= 0:
+            return ""
+        units = ["Б/с", "КБ/с", "МБ/с", "ГБ/с"]
+        i = 0
+        v = float(bps)
+        while v >= 1024.0 and i < len(units) - 1:
+            v /= 1024.0
+            i += 1
+        return f"{v:.1f} {units[i]}"
+
+    def _make_table() -> Table:
+        """Строит таблицу текущего состояния всех задач."""
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("#", style="dim", width=10, no_wrap=True)
+        table.add_column("Сайт", width=12, no_wrap=True)
+        table.add_column("Статус", width=14, no_wrap=True)
+        table.add_column("Прогресс", width=14, no_wrap=True)
+        table.add_column("Скорость", width=12, no_wrap=True)
+        table.add_column("Файл", width=22, no_wrap=True)
+
+        for i, t in enumerate(tasks, 1):
+            site_str = _extract_site(t["url"])
+            status = t["status"]
+
+            if status == "completed":
+                status_str = "[green]completed[/green]"
+            elif status == "error":
+                status_str = "[red]error[/red]"
+            elif status == "downloading":
+                status_str = "[cyan]downloading[/cyan]"
+            else:
+                status_str = f"[dim]{status}[/dim]"
+
+            pct = t.get("progress") or 0.0
+            if status == "completed":
+                progress_str = "████ 100%"
+            elif status == "error":
+                progress_str = "—"
+            else:
+                filled = min(4, int(pct / 25))
+                progress_str = "█" * filled + "░" * (4 - filled) + f" {pct:.0f}%"
+
+            speed_str = t.get("speed") or "" if status == "downloading" else ""
+            filename = t.get("filename") or ""
+            filename_short = ("…" + filename[-19:]) if len(filename) > 22 else filename
+
+            table.add_row(
+                str(i), site_str, status_str, progress_str, speed_str, filename_short,
+            )
+
+        return table
+
+    console.print(f"\n[bold]📋 Batch download: {len(urls)} URLs[/bold]")
+    console.print("─" * 50)
+
+    with Live(_make_table(), console=console, refresh_per_second=4) as live:
+        for t in tasks:
+            t["status"] = "downloading"
+            t["progress"] = 0.0
+            t["speed"] = ""
+            live.update(_make_table())
+
+            try:
+                # Захватываем t в замыкание явно, чтобы избежать ошибок при цикле
+                def _make_progress_cb(_t: dict):
+                    def on_progress(percent: float) -> None:
+                        _t["progress"] = percent
+                        live.update(_make_table())
+                    return on_progress
+
+                def _make_info_cb(_t: dict):
+                    def on_info(info: dict) -> None:
+                        if _t["status"] == "downloading":
+                            _t["speed"] = _fmt_speed(info.get("speed"))
+                        live.update(_make_table())
+                    return on_info
+
+                file_path = download_video(
+                    url=t["url"],
+                    output_path=output_path,
+                    cookies_path=cookies_path,
+                    progress_callback=_make_progress_cb(t),
+                    progress_info_callback=_make_info_cb(t),
+                )
+                t["status"] = "completed"
+                t["progress"] = 100.0
+                t["speed"] = ""
+                t["filename"] = os.path.basename(file_path)
+            except Exception as e:
+                t["status"] = "error"
+                t["error"] = str(e)
+
+            live.update(_make_table())
+
+    # Итоговая строка статистики
+    done = sum(1 for t in tasks if t["status"] == "completed")
+    failed = sum(1 for t in tasks if t["status"] == "error")
+    console.print(
+        f"⏳ In progress: 0  "
+        f"✅ Done: {done}  "
+        f"⏸ Queued: 0  "
+        f"❌ Failed: {failed}"
+    )
+    console.print()
+
+
 def _show_menu_and_handle(
     use_browser_parser: bool,
     browser_proxy_url: Optional[str],
@@ -234,7 +383,7 @@ def _show_menu_and_handle(
     while True:
         console.print()  # отступ перед показом меню
         console.print("[bold]GrabVidZilla[/bold] — кроссплатформенный загрузчик видео")
-        console.print("1. Скачать видео")
+        console.print("1. Скачать видео (один URL, несколько или файл со списком)")
         console.print("2. help")
         console.print("3. Загрузить cookies")
         console.print("4. Найти видео на странице")
@@ -243,14 +392,48 @@ def _show_menu_and_handle(
         choice = click.prompt("Выберите пункт", type=int, default=1)
 
         if choice == 1:
-            url = click.prompt("Введите URL видео", type=str)
+            import os
+            console.print("[dim]Один URL, несколько через пробел, или путь к файлу со списком URL:[/dim]")
+            raw = click.prompt("URL(ы) или файл", type=str).strip()
+
+            # Разбираем ввод: файл или список URL через пробел
+            if os.path.isfile(raw):
+                with open(raw, "r", encoding="utf-8") as _f:
+                    input_urls = [
+                        ln.strip() for ln in _f
+                        if ln.strip() and not ln.strip().startswith("#")
+                    ]
+            else:
+                input_urls = raw.split()
+
+            if not input_urls:
+                console.print("[yellow]Не введено ни одного URL.[/yellow]")
+                console.print()
+                continue
+
             # Сохраняем по умолчанию в папку Downloads в корне проекта
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            default_cookies = os.path.join(project_root, "tools", "cookies.txt")
+            use_cookies = default_cookies if os.path.isfile(default_cookies) else None
+
+            # Batch-режим: несколько URL → последовательное скачивание без анализа
+            if len(input_urls) > 1:
+                try:
+                    _run_batch_download_local(
+                        urls=input_urls,
+                        output_path="Downloads",
+                        cookies_path=use_cookies,
+                    )
+                except Exception:
+                    pass
+                finally:
+                    console.print()
+                continue
+
+            # Одиночный URL → полный анализ + выбор качества
+            url = input_urls[0]
             try:
                 # Если есть cookies в tools/cookies.txt — используем их
-                import os
-                project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-                default_cookies = os.path.join(project_root, "tools", "cookies.txt")
-                use_cookies = default_cookies if os.path.isfile(default_cookies) else None
                 video_title: Optional[str] = None
 
                 # Анализируем и предлагаем выбрать качество

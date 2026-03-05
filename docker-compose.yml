@@ -17,7 +17,6 @@ services:
 
   grabvidzilla-ui:
     image: grabvidzilla:latest
-    build: .
     container_name: grabvidzilla-ui
     working_dir: /app
     entrypoint: ["streamlit"]
@@ -39,7 +38,6 @@ services:
 
   grabvidzilla-api:
     image: grabvidzilla:latest
-    build: .
     container_name: grabvidzilla-api
     working_dir: /app
     entrypoint: ["uvicorn"]
@@ -55,7 +53,7 @@ services:
       - DOWNLOAD_TTL_HOURS=48
       - CLEANUP_INTERVAL_MIN=30
     ports:
-      - "8000:8000"
+      - "8585:8000"
     restart: unless-stopped
     volumes:
       - ./Downloads:/app/Downloads
@@ -66,7 +64,6 @@ services:
 
   grabvidzilla-worker:
     image: grabvidzilla:latest
-    build: .
     container_name: grabvidzilla-worker
     working_dir: /app
     entrypoint: ["python"]
@@ -96,7 +93,6 @@ services:
 
   grabvidzilla-tel-bot:
     image: grabvidzilla:latest
-    build: .
     container_name: grabvidzilla-tel-bot
     working_dir: /app
     entrypoint: ["python"]
