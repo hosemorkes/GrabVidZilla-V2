@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 from uuid import uuid4
 
-from core.db import SessionLocal, Download, init_db
+from core.db import SessionLocal, Download, SystemLog, init_db
 from core.downloader import probe_video
 
 logger = logging.getLogger(__name__)
@@ -99,6 +99,8 @@ class TaskManager:
         subtitle_lang: Optional[str] = None,
         webhook_url: Optional[str] = None,
         telegram_chat_id: Optional[str] = None,
+        source: Optional[str] = None,
+        user_id: Optional[int] = None,
     ) -> str:
         """Создаёт задачу скачивания в БД со статусом ``queued``.
 
@@ -112,6 +114,8 @@ class TaskManager:
             subtitle_lang: Язык субтитров.
             webhook_url: URL для POST-уведомления при завершении.
             telegram_chat_id: chat_id инициатора в Telegram.
+            source: Источник запроса («cli» | «ui» | «bot» | «api»).
+            user_id: ID пользователя (FK на users.id, опционально).
 
         Returns:
             UUID задачи.
@@ -145,6 +149,8 @@ class TaskManager:
                 subtitle_lang=subtitle_lang,
                 webhook_url=webhook_url,
                 telegram_chat_id=telegram_chat_id,
+                source=source,
+                user_id=user_id,
                 created_at=datetime.utcnow(),
             )
             session.add(dl)
@@ -179,19 +185,25 @@ class TaskManager:
             session.close()
 
     def cancel_task(self, task_id: str) -> None:
-        """Отменяет задачу, если она в queued или downloading.
+        """Отменяет или удаляет задачу.
 
-        Для ``queued`` — сразу ставим ``cancelled``.
-        Для ``downloading`` — ставим ``cancellation_requested=True``,
-        Worker прочитает этот флаг в progress_callback и прервёт скачивание.
+        - ``queued`` — сразу ставим ``cancelled``.
+        - ``downloading`` — ставим ``cancellation_requested=True``,
+          Worker прочитает флаг в progress_callback и прервёт скачивание.
+        - ``completed`` / ``error`` / ``cancelled`` — удаляем запись из БД
+          (пользователь убирает из истории).
         """
         session = SessionLocal()
         try:
             dl = session.query(Download).filter(Download.id == task_id).first()
             if not dl:
                 raise TaskNotFound(task_id)
-            if dl.status not in ("queued", "downloading"):
-                raise InvalidTaskState("cannot_cancel_in_current_state")
+
+            if dl.status in ("completed", "error", "cancelled"):
+                # Завершённая задача — просто удаляем из истории
+                session.delete(dl)
+                session.commit()
+                return
 
             now = datetime.utcnow()
 
@@ -320,7 +332,7 @@ class TaskManager:
             self._stop_cleanup.wait(self.cleanup_interval_min * 60)
 
     def _cleanup_once(self) -> None:
-        """Одна итерация TTL-очистки."""
+        """Одна итерация TTL-очистки задач и системных логов."""
         if self.persist_downloads:
             return
 
@@ -350,3 +362,85 @@ class TaskManager:
             session.commit()
         finally:
             session.close()
+
+        # Очистка старых системных логов (независимо от persist_downloads)
+        self.cleanup_old_logs()
+
+    def cleanup_old_logs(self) -> dict:
+        """Удаляет устаревшие записи из таблицы system_logs.
+
+        Две независимые стадии очистки:
+
+        1. **По возрасту** (если ``LOG_RETENTION_DAYS > 0``): удаляет все
+           записи, у которых ``created_at < now - LOG_RETENTION_DAYS``.
+        2. **По лимиту строк** (всегда): если количество строк в таблице
+           превышает ``MAX_LOG_ROWS``, удаляет самые старые записи (ORDER BY
+           ``created_at ASC``) так, чтобы осталось не более ``MAX_LOG_ROWS``.
+
+        Использует стандартный ``logging``, а не ``log_event``, чтобы избежать
+        рекурсии (``log_event`` пишет в ту же таблицу).
+
+        ENV-переменные:
+            LOG_RETENTION_DAYS: Хранить логи N дней (0 = без ограничения по возрасту).
+            MAX_LOG_ROWS: Максимальное число строк в system_logs (0 = без лимита).
+
+        Returns:
+            Словарь ``{"deleted_by_age": int, "deleted_by_limit": int}``.
+        """
+        log_retention_days = int(os.getenv("LOG_RETENTION_DAYS", "0"))
+        max_log_rows = int(os.getenv("MAX_LOG_ROWS", "100000"))
+
+        deleted_by_age = 0
+        deleted_by_limit = 0
+
+        session = SessionLocal()
+        try:
+            # --- Стадия 1: удаление по возрасту ----------------------------------
+            if log_retention_days > 0:
+                cutoff = datetime.utcnow() - timedelta(days=log_retention_days)
+                deleted_by_age = (
+                    session.query(SystemLog)
+                    .filter(SystemLog.created_at < cutoff)
+                    .delete(synchronize_session=False)
+                )
+                session.commit()
+                if deleted_by_age:
+                    logger.info(
+                        "cleanup_old_logs: удалено по возрасту %d записей "
+                        "(retention=%d дн., cutoff=%s)",
+                        deleted_by_age, log_retention_days, cutoff.isoformat(),
+                    )
+
+            # --- Стадия 2: обрезка по лимиту строк --------------------------------
+            if max_log_rows > 0:
+                total_rows = session.query(SystemLog).count()
+                excess = total_rows - max_log_rows
+                if excess > 0:
+                    # Получаем ID самых старых записей для удаления
+                    oldest_ids = [
+                        row.id
+                        for row in (
+                            session.query(SystemLog.id)
+                            .order_by(SystemLog.created_at.asc())
+                            .limit(excess)
+                            .all()
+                        )
+                    ]
+                    deleted_by_limit = (
+                        session.query(SystemLog)
+                        .filter(SystemLog.id.in_(oldest_ids))
+                        .delete(synchronize_session=False)
+                    )
+                    session.commit()
+                    logger.info(
+                        "cleanup_old_logs: удалено по лимиту %d записей "
+                        "(max=%d, было=%d)",
+                        deleted_by_limit, max_log_rows, total_rows,
+                    )
+
+        except Exception:
+            logger.exception("cleanup_old_logs: ошибка при очистке логов")
+        finally:
+            session.close()
+
+        return {"deleted_by_age": deleted_by_age, "deleted_by_limit": deleted_by_limit}

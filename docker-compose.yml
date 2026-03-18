@@ -15,26 +15,18 @@ services:
     networks:
       - grabvidzilla-net
 
-  grabvidzilla-ui:
-    image: grabvidzilla:latest
-    container_name: grabvidzilla-ui
-    working_dir: /app
-    entrypoint: ["streamlit"]
-    command:
-      - run
-      - ui/ui_app.py
-      - --server.address=0.0.0.0
-      - --server.port=8501
-    environment:
-      - HOME=/app
+  grabvidzilla-frontend:
+    build:
+      context: ./frontend/app
+      dockerfile: Dockerfile
+    container_name: grabvidzilla-frontend
     ports:
-      - "8501:8501"
+      - "3000:3000"
     restart: unless-stopped
-    volumes:
-      - ./Downloads:/app/Downloads
-      - ./tools:/app/tools
     networks:
       - grabvidzilla-net
+    depends_on:
+      - grabvidzilla-api
 
   grabvidzilla-api:
     image: grabvidzilla:latest
@@ -52,6 +44,8 @@ services:
       - DOWNLOADS_DIR=/app/Downloads
       - DOWNLOAD_TTL_HOURS=48
       - CLEANUP_INTERVAL_MIN=30
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-0}
+      - MAX_LOG_ROWS=${MAX_LOG_ROWS:-100000}
     ports:
       - "8585:8000"
     restart: unless-stopped
@@ -78,6 +72,8 @@ services:
       - WORKER_SHUTDOWN_TIMEOUT_SEC=30
       - PROGRESS_UPDATE_INTERVAL_MS=1000
       - DOWNLOAD_TTL_HOURS=48
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-0}
+      - MAX_LOG_ROWS=${MAX_LOG_ROWS:-100000}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - GVZ_API_URL=http://grabvidzilla-api:8000
       - GVZ_API_PUBLIC_URL=${GVZ_API_PUBLIC_URL}

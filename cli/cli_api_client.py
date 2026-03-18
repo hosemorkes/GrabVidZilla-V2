@@ -174,6 +174,7 @@ def _run_download_via_api(
             "url": url,
             "format": fmt if not audio_only else None,
             "audio_only": audio_only,
+            "source": "cli",  # Dashboard: отмечаем источник запроса
         }
         if cookies_path:
             payload["cookies_path"] = cookies_path

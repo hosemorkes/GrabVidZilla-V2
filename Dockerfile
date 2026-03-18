@@ -2,8 +2,6 @@
 FROM python:3.11-slim
 
 # Базовые переменные окружения для удобной отладки и меньшего мусора
-# GVZ_DOCKER_NETWORK — удобное имя сети, которую можно создать снаружи:
-#   docker network create ${GVZ_DOCKER_NETWORK}
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=UTF-8 \
@@ -18,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Рабочая директория
 WORKDIR /app
 
-# Используем /app как домашнюю директорию, чтобы UI и CLI сохраняли файлы в /app/Downloads
+# Используем /app как домашнюю директорию
 ENV HOME=/app
 
 # Подготовим стандартные каталоги внутри контейнера
@@ -27,20 +25,18 @@ RUN mkdir -p /app/Downloads /data /app/tools
 # Копирование файлов зависимостей
 COPY requirements.txt .
 
-# Установка зависимостей (включая yt-dlp из requirements.txt)
+# Установка зависимостей
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копирование всего проекта (core, api, ui, cli)
+# Копирование проекта (ui/ удалён — фронтенд переехал в frontend/app/)
 COPY core/ ./core/
 COPY api/ ./api/
-COPY ui/ ./ui/
 COPY cli/ ./cli/
 COPY worker/ ./worker/
 COPY bot/ ./bot/
 
-# Объявим точки монтирования (необязательно, но удобно как подсказка)
+# Объявим точки монтирования
 VOLUME ["/app/Downloads", "/data", "/app/tools"]
 
-# Точка входа: по умолчанию запускает CLI (без аргументов откроется меню)
+# Точка входа: по умолчанию запускает CLI
 ENTRYPOINT ["python", "-m", "cli.cli"]
-

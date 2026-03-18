@@ -29,6 +29,7 @@ from core.downloader import (
     convert_to_mp4 as convert_video_to_mp4,
 )
 from core.errors import classify_download_error
+from core.logger import log_event
 
 # ---------------------------------------------------------------------------
 # Конфигурация через переменные окружения
@@ -42,6 +43,22 @@ DOWNLOADS_DIR: str = os.getenv("DOWNLOADS_DIR", "Downloads")
 DOWNLOAD_TTL_HOURS: int = int(os.getenv("DOWNLOAD_TTL_HOURS", "48"))
 
 logger = logging.getLogger("grabvidzilla.worker")
+
+
+def _do_log(level: str, event_type: str, message: str, **kwargs) -> None:
+    """Вспомогательная функция: создаёт сессию, вызывает log_event, закрывает сессию.
+
+    Ошибки не пробрасывает — ошибка записи лога никогда не должна прерывать
+    скачивание или другую бизнес-логику.
+    """
+    try:
+        s = SessionLocal()
+        try:
+            log_event(s, level, "worker", event_type, message, **kwargs)
+        finally:
+            s.close()
+    except Exception:
+        logger.warning("_do_log: не удалось записать лог %r", event_type)
 
 
 class Worker:
@@ -64,6 +81,10 @@ class Worker:
             "Worker запущен: poll=%ds, max_concurrent=%d, downloads_dir=%s",
             POLL_INTERVAL, MAX_CONCURRENT, DOWNLOADS_DIR,
         )
+        _do_log("INFO", "system_startup", "Worker запущен",
+                details={"poll_interval": POLL_INTERVAL,
+                         "max_concurrent": MAX_CONCURRENT,
+                         "downloads_dir": DOWNLOADS_DIR})
 
         # Помечаем зависшие задачи от предыдущего запуска
         self._mark_interrupted_on_startup()
@@ -116,6 +137,11 @@ class Worker:
 
     async def _run_download(self, task_id: str) -> None:
         """Выполняет скачивание файла и обновляет запись в БД."""
+        # Предынициализируем поля, чтобы except-блок мог их использовать
+        # даже если исключение случилось до чтения задачи из БД.
+        task_user_id: Optional[int] = None
+        task_convert_to_mp4: bool = False
+        task_url: str = ""
         try:
             # Читаем параметры задачи
             session = SessionLocal()
@@ -131,8 +157,25 @@ class Worker:
                 # Флаги задачи конвертации
                 task_convert_to_mp4 = dl.convert_to_mp4
                 task_source_path = dl.output_path  # путь к исходному файлу (для конвертации)
+                # Для аудита
+                task_user_id = dl.user_id
+                task_source_field = dl.source
             finally:
                 session.close()
+
+            # Логируем начало задачи
+            _do_log(
+                "INFO",
+                "convert_started" if task_convert_to_mp4 else "download_started",
+                f"Начато {'конвертирование' if task_convert_to_mp4 else 'скачивание'}: {task_url}",
+                user_id=task_user_id,
+                task_id=task_id,
+                details={
+                    "url": task_url,
+                    "format": task_format if not task_convert_to_mp4 else None,
+                    "source": task_source_field,
+                },
+            )
 
             # Таймер для троттлинга обновлений прогресса в БД
             last_progress_update = 0.0
@@ -288,6 +331,20 @@ class Worker:
             finally:
                 session.close()
 
+            # Логируем успешное завершение
+            _do_log(
+                "INFO",
+                "convert_completed" if task_convert_to_mp4 else "download_completed",
+                f"Задача завершена: {os.path.basename(result_path)}",
+                user_id=task_user_id,
+                task_id=task_id,
+                details={
+                    "filename": os.path.basename(result_path),
+                    "sha256": checksum,
+                    "size_bytes": file_size,
+                },
+            )
+
             # Уведомления (webhook + Telegram) — после commit
             await _send_notifications(task_id)
 
@@ -314,6 +371,20 @@ class Worker:
             finally:
                 session.close()
             logger.error("Ошибка скачивания задачи %s: %s", task_id, e)
+
+            # Логируем ошибку
+            _do_log(
+                "ERROR",
+                "convert_failed" if task_convert_to_mp4 else "download_failed",
+                f"Ошибка {'конвертирования' if task_convert_to_mp4 else 'скачивания'}: {error_message}",
+                user_id=task_user_id,
+                task_id=task_id,
+                details={
+                    "url": task_url,
+                    "error_type": error_type,
+                    "error_message": error_message,
+                },
+            )
 
             # Уведомления при ошибке тоже отправляем
             await _send_notifications(task_id)
@@ -420,6 +491,7 @@ class Worker:
                 session.close()
 
         logger.info("Worker остановлен.")
+        _do_log("INFO", "system_shutdown", "Worker остановлен")
 
 
 def _try_claim_task() -> Optional[str]:
@@ -626,6 +698,10 @@ def main() -> None:
                 "Worker запущен (Windows): poll=%ds, max_concurrent=%d, downloads_dir=%s",
                 POLL_INTERVAL, MAX_CONCURRENT, DOWNLOADS_DIR,
             )
+            _do_log("INFO", "system_startup", "Worker запущен (Windows)",
+                    details={"poll_interval": POLL_INTERVAL,
+                             "max_concurrent": MAX_CONCURRENT,
+                             "downloads_dir": DOWNLOADS_DIR})
             worker._mark_interrupted_on_startup()
             await worker._poll_loop()
 
@@ -633,6 +709,7 @@ def main() -> None:
             asyncio.run(_run_windows())
         except KeyboardInterrupt:
             logger.info("Worker остановлен (KeyboardInterrupt).")
+            _do_log("INFO", "system_shutdown", "Worker остановлен (KeyboardInterrupt)")
     else:
         asyncio.run(worker.run())
 

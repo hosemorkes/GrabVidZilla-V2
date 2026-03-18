@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "additionalDirectories": [
+      "d:\\ProjectsLab\\GrabVidZilla-V2\\frontend\\app\\src"
+    ],
+    "allow": [
+      "Bash(python3 -c \":*)"
+    ]
+  }
+}

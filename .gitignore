@@ -34,10 +34,6 @@ env/
 *~
 .cursor/
 
-# Streamlit
-.streamlit/
-.streamlit/secrets.toml
-
 # Project specific
 *.log
 .env
@@ -77,3 +73,16 @@ tools/ffmpeg/
 
 # Временные файлы и хлам
 temp/
+
+# Старый UI (NiceGUI/Streamlit — архив)
+ui_backup/
+
+# React / Node.js
+frontend/app/node_modules/
+frontend/app/dist/
+frontend/app/.env.local
+frontend/app/.env.production
+
+# Исходники Figma Make (можно удалить после объединения в frontend/app/)
+frontend/Figma template for GrabVidZilla/
+frontend/Создать страницы авторизации/

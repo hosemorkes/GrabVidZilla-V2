@@ -52,6 +52,8 @@ class User(Base):
     is_active: bool = Column(Boolean, nullable=False, default=True)
     is_admin: bool = Column(Boolean, nullable=False, default=False)
     role: str = Column(String(32), nullable=False, default="user")
+    # Telegram chat_id для привязки бота к аккаунту
+    telegram_chat_id: str | None = Column(String(64), nullable=True, unique=True, index=True)
     created_at: datetime = Column(
         DateTime, nullable=False, default=datetime.utcnow
     )
@@ -88,6 +90,28 @@ def get_user_by_email(db: Session, email: str) -> Optional[User]:
 def get_user_by_name(db: Session, name: str) -> Optional[User]:
     """Возвращает пользователя по имени или None."""
     return db.query(User).filter(User.name == name).first()
+
+
+def get_user_by_telegram_id(session: Session, telegram_chat_id: str) -> Optional[User]:
+    """Ищет пользователя по привязанному Telegram chat_id.
+
+    Используется ботом для определения user_id при входящих сообщениях:
+    бот передаёт свой chat_id, и мы находим соответствующего пользователя
+    в базе данных.
+
+    Аргументы:
+        session         — сессия SQLAlchemy.
+        telegram_chat_id — строковый идентификатор чата Telegram (chat.id).
+
+    Возвращает:
+        Объект User, если найден, иначе None.
+
+    Пример использования:
+        user = get_user_by_telegram_id(db, str(message.chat.id))
+        if user is None:
+            # аккаунт не привязан — просим пользователя войти через /login
+    """
+    return session.query(User).filter(User.telegram_chat_id == telegram_chat_id).first()
 
 
 def list_users(db: Session) -> list[User]:
@@ -161,6 +185,7 @@ def update_user(
     role: Optional[str] = None,
     is_admin: Optional[bool] = None,
     is_active: Optional[bool] = None,
+    telegram_chat_id: Optional[str] = None,
 ) -> User:
     """Обновляет данные пользователя и возвращает обновлённый объект.
 
@@ -206,6 +231,12 @@ def update_user(
         user.is_admin = bool(is_admin)
     if is_active is not None:
         user.is_active = bool(is_active)
+    if telegram_chat_id is not None:
+        # Проверяем, что этот Telegram ID ещё не занят другим пользователем
+        existing_tg = get_user_by_telegram_id(db, telegram_chat_id)
+        if existing_tg is not None and existing_tg.id != user.id:
+            raise ValueError("Этот Telegram ID уже привязан к другому аккаунту.")
+        user.telegram_chat_id = telegram_chat_id
 
     user.updated_at = datetime.utcnow()
     db.add(user)

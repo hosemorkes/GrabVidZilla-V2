@@ -175,6 +175,38 @@ def _time_ago(iso_str: str | None) -> str:
         return ""
 
 
+async def _get_user_id_by_telegram(telegram_chat_id: str) -> Optional[int]:
+    """Ищет зарегистрированного пользователя GrabVidZilla по Telegram chat_id.
+
+    Делает GET {GVZ_API_URL}/users?telegram_chat_id={telegram_chat_id}.
+    Возвращает user_id (int) если найден, None если пользователь не привязан
+    или API недоступен.
+
+    Оборачивает в try/except — ошибка запроса не роняет бота.
+    Таймаут: 5 секунд.
+
+    Args:
+        telegram_chat_id: строковый chat.id из Telegram.
+
+    Returns:
+        int user_id из GrabVidZilla или None.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(
+                f"{API_URL}/users",
+                params={"telegram_chat_id": telegram_chat_id},
+            )
+            if resp.status_code == 404:
+                # Пользователь не привязал аккаунт — это нормальная ситуация
+                return None
+            resp.raise_for_status()
+            return resp.json().get("id")
+    except Exception:
+        # Ошибка сети или API — не прерываем работу бота
+        return None
+
+
 async def _send_file_to_chat(bot: Bot, chat_id: int | str, task_id: str) -> bool:
     """Скачивает файл через API и отправляет в чат как документ.
 
@@ -216,6 +248,48 @@ async def _send_file_to_chat(bot: Bot, chat_id: int | str, task_id: str) -> bool
     except Exception as e:
         logger.warning("Не удалось отправить файл %s в чат %s: %s", task_id, chat_id, e)
         return False
+
+
+async def _bot_log(
+    level: str,
+    event_type: str,
+    message: str,
+    user_id: Optional[int] = None,
+    task_id: Optional[int] = None,
+    details: Optional[dict] = None,
+) -> None:
+    """Отправляет запись о событии на POST {API_URL}/logs.
+
+    Бот не импортирует core напрямую, поэтому логирование идёт через HTTP API.
+    Ошибка отправки не прерывает работу бота — try/except всё поглощает.
+
+    Args:
+        level:      уровень (INFO / WARNING / ERROR / CRITICAL).
+        event_type: тип события из core.logger.EVENT_TYPES.
+        message:    человекочитаемое описание события.
+        user_id:    внутренний ID пользователя GrabVidZilla (None — нет маппинга).
+        task_id:    INTEGER id задачи в system_logs (обычно None для бота,
+                    т.к. GrabVidZilla task_id — UUID-строка; кладём в details).
+        details:    произвольный словарь с дополнительным контекстом.
+                    Всегда добавляй ``telegram_chat_id`` если user_id=None.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(
+                f"{API_URL}/logs",
+                json={
+                    "level": level,
+                    "source": "bot",
+                    "event_type": event_type,
+                    "message": message,
+                    "user_id": user_id,
+                    "task_id": task_id,
+                    "details": details,
+                },
+            )
+    except Exception:
+        # Намеренно молчим — не создаём спам при недоступности API
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +612,16 @@ async def cb_convert(callback: CallbackQuery) -> None:
         await callback.message.answer(f"❌ Ошибка: {e}")
         return
 
+    await _bot_log(
+        "INFO", "convert_started",
+        "Бот запустил конвертацию в MP4",
+        details={
+            "source_task_id": task_id,
+            "convert_task_id": new_task_id,
+            "telegram_chat_id": chat_id,
+        },
+    )
+
     short = _short_id(new_task_id)
     # Отправляем отдельное сообщение для отображения прогресса конвертации
     status_msg = await callback.message.answer(
@@ -601,6 +685,16 @@ async def _track_task(
                     pass  # message not modified
 
         elif status == "completed":
+            await _bot_log(
+                "INFO", "download_completed",
+                f"Задача завершена: {task.get('filename', '?')}",
+                details={
+                    "task_id": task_id,
+                    "telegram_chat_id": chat_id,
+                    "filename": task.get("filename"),
+                    "file_size": task.get("file_size"),
+                },
+            )
             filename = task.get("filename", "?")
             file_size = task.get("file_size") or 0
 
@@ -657,6 +751,16 @@ async def _track_task(
             break
 
         elif status == "error":
+            await _bot_log(
+                "ERROR", "download_failed",
+                f"Ошибка задачи: {task.get('error_message', '')}",
+                details={
+                    "task_id": task_id,
+                    "telegram_chat_id": chat_id,
+                    "error_message": task.get("error_message"),
+                    "error_type": task.get("error_type"),
+                },
+            )
             err = task.get("error_message", "Неизвестная ошибка")
             try:
                 await status_msg.edit_text(f"❌ Ошибка: {err}")
@@ -689,12 +793,21 @@ async def _start_and_track(
     else:
         chat_id = str(event.chat.id)
 
+    # Шаг 1: ищем пользователя GrabVidZilla по привязанному Telegram chat_id.
+    # Если аккаунт привязан — передаём user_id в задачу (аудит, фильтрация в UI).
+    # Если нет — пользователь всё равно был пропущен middleware (TELEGRAM_ALLOWED_USERS
+    # или пустой список), создаём задачу с user_id=None (текущее поведение).
+    gvz_user_id = await _get_user_id_by_telegram(chat_id)
+
     # Создаём задачу
     payload = {
         "url": url,
         "audio_only": audio_only,
         "telegram_chat_id": chat_id,
+        "source": "bot",  # Dashboard: отмечаем источник запроса
     }
+    if gvz_user_id is not None:
+        payload["user_id"] = gvz_user_id
     if fmt:
         payload["format"] = fmt
 
@@ -705,6 +818,12 @@ async def _start_and_track(
     except Exception as e:
         await status_msg.edit_text(f"❌ Не удалось создать задачу: {e}")
         return
+
+    await _bot_log(
+        "INFO", "download_started",
+        f"Бот запустил скачивание: {url[:80]}",
+        details={"task_id": task_id, "telegram_chat_id": chat_id, "url": url},
+    )
 
     short = _short_id(task_id)
     await status_msg.edit_text(f"⏳ Добавлено в очередь. ID: <code>{short}</code>", parse_mode=ParseMode.HTML)

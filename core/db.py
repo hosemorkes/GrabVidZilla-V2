@@ -13,12 +13,12 @@ creates all tables.
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Generator
 
 from sqlalchemy import (
-    Boolean, Column, DateTime, Float, Integer, String, Text,
+    Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text,
     create_engine, event, text as sa_text,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
@@ -93,6 +93,8 @@ class Download(Base):
     webhook_sent: bool = Column(Boolean, default=False)            # флаг: webhook уже отправлен
     telegram_chat_id: str | None = Column(String, nullable=True)   # chat_id инициатора в Telegram
     convert_to_mp4: bool = Column(Boolean, default=False)          # True — задача конвертации в MP4
+    source: str | None = Column(String, nullable=True)             # Источник: "cli" | "ui" | "bot" | "api"
+    user_id: int | None = Column(Integer, nullable=True)           # ID пользователя (FK на users.id, nullable)
 
     def to_dict(self) -> dict:
         """Сериализация записи в словарь для API-ответов."""
@@ -123,7 +125,56 @@ class Download(Base):
             "webhook_sent": self.webhook_sent,
             "telegram_chat_id": self.telegram_chat_id,
             "convert_to_mp4": self.convert_to_mp4,
+            "source": self.source,
+            "user_id": self.user_id,
         }
+
+
+class SystemLog(Base):
+    """Модель системного лога — запись о событии в любом слое приложения.
+
+    Используется для аудита действий пользователей, ошибок и ключевых
+    событий (старт задачи, вход в систему, ошибка воркера и т.д.).
+
+    Атрибуты:
+        id          — автоинкрементный первичный ключ.
+        created_at  — UTC-время создания записи (индексировано).
+        level       — уровень: INFO / WARNING / ERROR / CRITICAL.
+        source      — слой-источник: api / worker / bot / cli.
+        event_type  — машиночитаемый тип события (индексировано).
+        user_id     — FK на users.id (nullable); SET NULL при удалении.
+        task_id     — FK на downloads.id (nullable); SET NULL при удалении.
+        message     — человекочитаемое описание события.
+        details     — JSON-строка с дополнительными данными (nullable).
+        ip_address  — IP-адрес инициатора (nullable).
+    """
+
+    __tablename__ = "system_logs"
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    created_at: datetime = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        index=True,
+    )
+    level: str = Column(String, nullable=False)           # INFO / WARNING / ERROR / CRITICAL
+    source: str = Column(String, nullable=False)          # api / worker / bot / cli
+    event_type: str = Column(String, nullable=False, index=True)
+    user_id: int | None = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    task_id: int | None = Column(
+        Integer,
+        ForeignKey("downloads.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    message: str = Column(String, nullable=False)
+    details: str | None = Column(Text, nullable=True)     # JSON-строка
+    ip_address: str | None = Column(String, nullable=True)
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -202,5 +253,52 @@ def _migrate_add_missing_columns() -> None:
         if "convert_to_mp4" not in existing_columns:
             conn.execute(
                 sa_text("ALTER TABLE downloads ADD COLUMN convert_to_mp4 BOOLEAN DEFAULT 0")
+            )
+            conn.commit()
+
+        # Фаза 6: dashboard — источник запроса и пользователь
+        for col_name, col_def in [
+            ("source", "VARCHAR"),
+            ("user_id", "INTEGER"),
+        ]:
+            if col_name not in existing_columns:
+                conn.execute(sa_text(f"ALTER TABLE downloads ADD COLUMN {col_name} {col_def}"))
+                conn.commit()
+
+        # Фаза 7: системные логи — проверяем колонки таблицы system_logs
+        result = conn.execute(sa_text("PRAGMA table_info(system_logs)"))
+        existing_log_columns = {row[1] for row in result}
+
+        # Таблица могла быть создана без каких-то колонок при старой версии кода
+        for col_name, col_def in [
+            ("created_at", "DATETIME NOT NULL DEFAULT (datetime('now'))"),
+            ("level",      "VARCHAR NOT NULL DEFAULT 'INFO'"),
+            ("source",     "VARCHAR NOT NULL DEFAULT 'api'"),
+            ("event_type", "VARCHAR NOT NULL DEFAULT ''"),
+            ("user_id",    "INTEGER"),
+            ("task_id",    "INTEGER"),
+            ("message",    "VARCHAR NOT NULL DEFAULT ''"),
+            ("details",    "TEXT"),
+            ("ip_address", "VARCHAR"),
+        ]:
+            if col_name not in existing_log_columns:
+                conn.execute(
+                    sa_text(f"ALTER TABLE system_logs ADD COLUMN {col_name} {col_def}")
+                )
+                conn.commit()
+
+        # Фаза 8: привязка Telegram к пользователю — проверяем таблицу users
+        result = conn.execute(sa_text("PRAGMA table_info(users)"))
+        existing_user_columns = {row[1] for row in result}
+
+        if "telegram_chat_id" not in existing_user_columns:
+            # SQLite не поддерживает ADD COLUMN ... UNIQUE —
+            # добавляем колонку без ограничения, затем создаём уникальный индекс отдельно.
+            conn.execute(sa_text("ALTER TABLE users ADD COLUMN telegram_chat_id TEXT"))
+            conn.execute(
+                sa_text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_telegram_chat_id "
+                    "ON users (telegram_chat_id)"
+                )
             )
             conn.commit()
